@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import requests
-import ccxt
 import time
 from datetime import datetime
 
@@ -44,17 +43,10 @@ def send_telegram_alert(message):
         return False, f"خطأ في الاتصال: {e}"
 
 # ---------------------------------------------------------
-# 2. إدارة ذاكرة النظام وتخزين كائن Exchange لمنع Rate Limit
+# 2. إدارة ذاكرة النظام لتتبع الإشارات
 # ---------------------------------------------------------
 if "last_signal" not in st.session_state:
     st.session_state.last_signal = {}
-
-@st.cache_resource
-def get_shared_exchange():
-    """حفظ كائن الاتصال في الذاكرة لتجنب استدعاء load_markets المكرر"""
-    exchange = ccxt.bybit({'enableRateLimit': True})
-    exchange.load_markets()
-    return exchange
 
 # ---------------------------------------------------------
 # 3. الشريط الجانبي (Sidebar)
@@ -64,8 +56,15 @@ st.sidebar.caption("Institutional Quantitative Engine")
 
 st.sidebar.markdown("---")
 
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "ZEC/USDT", "XRP/USDT"]
-selected_symbol = st.sidebar.selectbox("اختر العملة للتحليل العميق:", SYMBOLS, index=0)
+SYMBOLS_MAP = {
+    "BTC/USDT": "BTCUSDT",
+    "ETH/USDT": "ETHUSDT",
+    "ZEC/USDT": "ZECUSDT",
+    "XRP/USDT": "XRPUSDT"
+}
+
+selected_display_symbol = st.sidebar.selectbox("اختر العملة للتحليل العميق:", list(SYMBOLS_MAP.keys()), index=0)
+selected_symbol = SYMBOLS_MAP[selected_display_symbol]
 
 timeframe = st.sidebar.selectbox("الإطار الزمني (Timeframe):", ["5m", "15m", "1h", "4h", "1d"], index=2)
 
@@ -80,7 +79,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ اختيارات التنبيه اليدوي")
 
 if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
-    test_msg = f"⚡ *AliQuantFund - Ticker Test*\n\nالعملة: `{selected_symbol}`\nالإطار الزمني: `{timeframe}`\nالحالة: الاتصال بالبوت نشط وناجح 🚀"
+    test_msg = f"⚡ *AliQuantFund - Ticker Test*\n\nالعملة: `{selected_display_symbol}`\nالإطار الزمني: `{timeframe}`\nالحالة: الاتصال بالبوت نشط وناجح 🚀"
     success, msg = send_telegram_alert(test_msg)
     if success:
         st.sidebar.success(msg)
@@ -88,15 +87,83 @@ if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
         st.sidebar.error(msg)
 
 # ---------------------------------------------------------
-# 4. جلب البيانات وحساب المؤشرات
+# 4. جلب البيانات المباشرة عبر HTTP Requests (مقاوم للـ Rate Limit)
 # ---------------------------------------------------------
-@st.cache_data(ttl=20)
-def fetch_market_data(symbol, tf):
-    exchange = get_shared_exchange()
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=120)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
+@st.cache_data(ttl=15)
+def fetch_tickers_fast():
+    """جلب الأسعار مباشرة عبر API خفيف وقادر على العمل على Cloud"""
+    tickers = {}
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            data_dict = {item['symbol']: item for item in data}
+            for display, sym in SYMBOLS_MAP.items():
+                if sym in data_dict:
+                    tickers[display] = {
+                        'price': float(data_dict[sym]['lastPrice']),
+                        'change': float(data_dict[sym]['priceChangePercent'])
+                    }
+                else:
+                    tickers[display] = {'price': 0.0, 'change': 0.0}
+            return tickers
+    except Exception:
+        pass
+
+    # Backup Endpoint in case of US Cloud block
+    try:
+        url_alt = "https://api.bybit.com/v5/market/tickers?category=spot"
+        res = requests.get(url_alt, timeout=5)
+        if res.status_code == 200:
+            data = res.json().get('result', {}).get('list', [])
+            data_dict = {item['symbol']: item for item in data}
+            for display, sym in SYMBOLS_MAP.items():
+                if sym in data_dict:
+                    last_p = float(data_dict[sym]['lastPrice'])
+                    prev_p = float(data_dict[sym].get('prevPrice24h', last_p))
+                    chg = ((last_p - prev_p) / prev_p * 100) if prev_p > 0 else 0.0
+                    tickers[display] = {'price': last_p, 'change': chg}
+                else:
+                    tickers[display] = {'price': 0.0, 'change': 0.0}
+            return tickers
+    except Exception:
+        pass
+
+    for display in SYMBOLS_MAP.keys():
+        tickers[display] = {'price': 0.0, 'change': 0.0}
+    return tickers
+
+@st.cache_data(ttl=15)
+def fetch_market_data_fast(symbol, tf):
+    """جلب الشموع مباشرة عبر HTTP دون تحميل أسواق المنصة الكلية"""
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&limit=120"
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            raw_data = res.json()
+            df = pd.DataFrame(raw_data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'qav', 'num_trades', 'tb_base', 'tb_quote', 'ignore'
+            ])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+        else:
+            raise Exception("Primary API unreachable")
+    except Exception:
+        # Fallback to Bybit
+        tf_map = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+        bybit_tf = tf_map.get(tf, "60")
+        url_bybit = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={bybit_tf}&limit=120"
+        res = requests.get(url_bybit, timeout=5)
+        raw_data = res.json().get('result', {}).get('list', [])
+        raw_data.reverse() # Bybit returns newest first
+        df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
+
     # Anchored VWAP
     df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
     df['vp'] = df['typical_price'] * df['volume']
@@ -122,45 +189,16 @@ def fetch_market_data(symbol, tf):
     
     return df
 
-@st.cache_data(ttl=20)
-def fetch_tickers():
-    exchange = get_shared_exchange()
-    tickers = {}
-    try:
-        # جلب جميع الأسعار دفعة واحدة لتقليل الطلبات
-        all_tickers = exchange.fetch_tickers(SYMBOLS)
-        for sym in SYMBOLS:
-            if sym in all_tickers:
-                t = all_tickers[sym]
-                tickers[sym] = {
-                    'price': t.get('last', 0.0),
-                    'change': t.get('percentage', 0.0) if t.get('percentage') is not None else 0.0
-                }
-            else:
-                tickers[sym] = {'price': 0.0, 'change': 0.0}
-    except Exception:
-        # في حال الفشل الفردي يتم الجلب الفردي الآمن
-        for sym in SYMBOLS:
-            try:
-                t = exchange.fetch_ticker(sym)
-                tickers[sym] = {
-                    'price': t.get('last', 0.0),
-                    'change': t.get('percentage', 0.0) if t.get('percentage') is not None else 0.0
-                }
-            except Exception:
-                tickers[sym] = {'price': 0.0, 'change': 0.0}
-    return tickers
-
 # ---------------------------------------------------------
 # 5. واجهة مركز القيادة والسيطرة
 # ---------------------------------------------------------
 st.title("⚡ AliQuantFund (Control Center)")
 st.caption(f"تحديث أخير: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-tickers_data = fetch_tickers()
+tickers_data = fetch_tickers_fast()
 cols = st.columns(4)
 
-for i, sym in enumerate(SYMBOLS):
+for i, sym in enumerate(SYMBOLS_MAP.keys()):
     short_name = sym.split('/')[0]
     p = tickers_data[sym]['price']
     c = tickers_data[sym]['change']
@@ -169,12 +207,12 @@ for i, sym in enumerate(SYMBOLS):
 
 st.markdown("---")
 
-df = fetch_market_data(selected_symbol, timeframe)
+df = fetch_market_data_fast(selected_symbol, timeframe)
 
 col_chart, col_signal = st.columns([2.2, 1])
 
 with col_chart:
-    st.subheader(f"📊 التحليل الكمي المدمج: {selected_symbol}")
+    st.subheader(f"📊 التحليل الكمي المدمج: {selected_display_symbol}")
     
     fig = go.Figure()
     
@@ -239,7 +277,7 @@ with col_signal:
         
     score = int(np.clip(score, 0, 100))
     
-    st.info(f"الأصل: **{selected_symbol}**")
+    st.info(f"الأصل: **{selected_display_symbol}**")
     st.progress(score / 100)
     st.caption(f"التقييم المركب (Composite Quant Score): **{score}/100**")
     
@@ -260,15 +298,15 @@ with col_signal:
     # 6. فحص وأتمتة التنبيهات التلقائية (Auto-Alert Dispatcher)
     # ---------------------------------------------------------
     if auto_alerts_enabled:
-        prev_signal = st.session_state.last_signal.get(selected_symbol)
+        prev_signal = st.session_state.last_signal.get(selected_display_symbol)
         
         if prev_signal != recommendation:
-            st.session_state.last_signal[selected_symbol] = recommendation
+            st.session_state.last_signal[selected_display_symbol] = recommendation
             
             if prev_signal is not None:
                 alert_text = (
                     f"🚨 *تنبيه تغيير النظام الكمي - AliQuantFund*\n\n"
-                    f"📌 **الأصل:** `{selected_symbol}`\n"
+                    f"📌 **الأصل:** `{selected_display_symbol}`\n"
                     f"⏱️ **الإطار الزمني:** `{timeframe}`\n"
                     f"🔄 **التغيير:** `{prev_signal}` ➡️ **{recommendation}**\n"
                     f"📊 **النتيجة الكمية (Score):** `{score}/100`\n"
@@ -318,7 +356,7 @@ with risk_col2:
         sl_pct = (sl_distance / entry_p) * 100
         tp_pct = (tp_distance / entry_p) * 100
         
-        base_asset = selected_symbol.split('/')[0]
+        base_asset = selected_display_symbol.split('/')[0]
         
         st.markdown("### 📊 نتائج إدارة المخاطر:")
         st.error(f"⚠️ **أقصى خسارة مسموح بها:** `${risk_amount:,.2f}` (نسبة {risk_pct}%)")
@@ -336,7 +374,7 @@ with risk_col2:
         st.error("خطأ: سعر وقف الخسارة يجب ألا يكون مساوياً لسعر الدخول.")
 
 # ---------------------------------------------------------
-# 8. التحديث التلقائي للواجهة بدون مكتبات خارجية
+# 8. التحديث التلقائي للواجهة
 # ---------------------------------------------------------
 if auto_refresh:
     time.sleep(refresh_seconds)
