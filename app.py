@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -49,15 +50,9 @@ def send_telegram_alert(message):
 if "last_signal" not in st.session_state:
     st.session_state.last_signal = {}
 
-# دالة مخصصة لإنشاء اتصال Binance يتجاوز القيود الجغرافية لخوادم السحابة
-def get_binance_exchange():
-    exchange = ccxt.binance({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'}
-    })
-    # تغيير الـ Endpoint لتجنب حظر IP السحابة في الولايات المتحدة
-    exchange.urls['api']['public'] = 'https://data.binance.com/api/v3'
-    return exchange
+# استخدام منصة Bybit لتجاوز حظر Binance الجغرافي على خوادم السحابة
+def get_exchange():
+    return ccxt.bybit({'enableRateLimit': True})
 
 # ---------------------------------------------------------
 # 3. الشريط الجانبي (Sidebar)
@@ -95,7 +90,7 @@ if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
 # ---------------------------------------------------------
 @st.cache_data(ttl=10)
 def fetch_market_data(symbol, tf):
-    exchange = get_binance_exchange()
+    exchange = get_exchange()
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=120)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -127,14 +122,14 @@ def fetch_market_data(symbol, tf):
 
 @st.cache_data(ttl=10)
 def fetch_tickers():
-    exchange = get_binance_exchange()
+    exchange = get_exchange()
     tickers = {}
     for sym in SYMBOLS:
         try:
             ticker = exchange.fetch_ticker(sym)
             tickers[sym] = {
                 'price': ticker['last'],
-                'change': ticker['percentage']
+                'change': ticker['percentage'] if ticker['percentage'] is not None else 0.0
             }
         except Exception:
             tickers[sym] = {'price': 0.0, 'change': 0.0}
