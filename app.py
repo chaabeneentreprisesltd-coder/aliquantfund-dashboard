@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -45,14 +44,17 @@ def send_telegram_alert(message):
         return False, f"خطأ في الاتصال: {e}"
 
 # ---------------------------------------------------------
-# 2. إدارة ذاكرة النظام لتتبع الإشارات تلقائياً
+# 2. إدارة ذاكرة النظام وتخزين كائن Exchange لمنع Rate Limit
 # ---------------------------------------------------------
 if "last_signal" not in st.session_state:
     st.session_state.last_signal = {}
 
-# استخدام منصة Bybit لتجاوز حظر Binance الجغرافي على خوادم السحابة
-def get_exchange():
-    return ccxt.bybit({'enableRateLimit': True})
+@st.cache_resource
+def get_shared_exchange():
+    """حفظ كائن الاتصال في الذاكرة لتجنب استدعاء load_markets المكرر"""
+    exchange = ccxt.bybit({'enableRateLimit': True})
+    exchange.load_markets()
+    return exchange
 
 # ---------------------------------------------------------
 # 3. الشريط الجانبي (Sidebar)
@@ -70,7 +72,7 @@ timeframe = st.sidebar.selectbox("الإطار الزمني (Timeframe):", ["5m"
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔄 إعدادات التحديث")
 auto_refresh = st.sidebar.checkbox("تفعيل التحديث التلقائي الشامل", value=False)
-refresh_seconds = st.sidebar.slider("معدل التحديث (بالثواني):", min_value=10, max_value=120, value=30, step=10)
+refresh_seconds = st.sidebar.slider("معدل التحديث (بالثواني):", min_value=15, max_value=120, value=30, step=5)
 
 auto_alerts_enabled = st.sidebar.toggle("🚨 تفعيل التنبيهات الآلية التلقائية", value=True)
 
@@ -88,9 +90,9 @@ if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
 # ---------------------------------------------------------
 # 4. جلب البيانات وحساب المؤشرات
 # ---------------------------------------------------------
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=20)
 def fetch_market_data(symbol, tf):
-    exchange = get_exchange()
+    exchange = get_shared_exchange()
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=120)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -120,19 +122,33 @@ def fetch_market_data(symbol, tf):
     
     return df
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=20)
 def fetch_tickers():
-    exchange = get_exchange()
+    exchange = get_shared_exchange()
     tickers = {}
-    for sym in SYMBOLS:
-        try:
-            ticker = exchange.fetch_ticker(sym)
-            tickers[sym] = {
-                'price': ticker['last'],
-                'change': ticker['percentage'] if ticker['percentage'] is not None else 0.0
-            }
-        except Exception:
-            tickers[sym] = {'price': 0.0, 'change': 0.0}
+    try:
+        # جلب جميع الأسعار دفعة واحدة لتقليل الطلبات
+        all_tickers = exchange.fetch_tickers(SYMBOLS)
+        for sym in SYMBOLS:
+            if sym in all_tickers:
+                t = all_tickers[sym]
+                tickers[sym] = {
+                    'price': t.get('last', 0.0),
+                    'change': t.get('percentage', 0.0) if t.get('percentage') is not None else 0.0
+                }
+            else:
+                tickers[sym] = {'price': 0.0, 'change': 0.0}
+    except Exception:
+        # في حال الفشل الفردي يتم الجلب الفردي الآمن
+        for sym in SYMBOLS:
+            try:
+                t = exchange.fetch_ticker(sym)
+                tickers[sym] = {
+                    'price': t.get('last', 0.0),
+                    'change': t.get('percentage', 0.0) if t.get('percentage') is not None else 0.0
+                }
+            except Exception:
+                tickers[sym] = {'price': 0.0, 'change': 0.0}
     return tickers
 
 # ---------------------------------------------------------
