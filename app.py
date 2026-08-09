@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,7 +7,7 @@ import time
 from datetime import datetime
 
 # ---------------------------------------------------------
-# 1. تهيئة إعدادات الصفحة واسم التطبيق
+# 1. تهيئة إعدادات الصفحة
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="AliQuantFund | Quant Dashboard",
@@ -56,10 +55,10 @@ st.sidebar.caption("Institutional Quantitative Engine")
 st.sidebar.markdown("---")
 
 SYMBOLS_MAP = {
-    "BTC/USDT": {"fsym": "BTC", "base_price": 65000.0},
-    "ETH/USDT": {"fsym": "ETH", "base_price": 3500.0},
-    "ZEC/USDT": {"fsym": "ZEC", "base_price": 42.0},
-    "XRP/USDT": {"fsym": "XRP", "base_price": 0.58}
+    "BTC/USDT": {"cg_id": "bitcoin", "symbol_us": "BTCUSDT"},
+    "ETH/USDT": {"cg_id": "ethereum", "symbol_us": "ETHUSDT"},
+    "ZEC/USDT": {"cg_id": "zcash", "symbol_us": "ZECUSDT"},
+    "XRP/USDT": {"cg_id": "ripple", "symbol_us": "XRPUSDT"}
 }
 
 selected_display_symbol = st.sidebar.selectbox("اختر العملة للتحليل العميق:", list(SYMBOLS_MAP.keys()), index=0)
@@ -85,83 +84,80 @@ if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
         st.sidebar.error(msg)
 
 # ---------------------------------------------------------
-# 4. جلب البيانات عبر واجهات آمنة الخلو من الحظر والإسقاط
+# 4. جلب الأسعار الحقيقية من Binance.US (مفتوحة لسيرفرات السحابة الأمريكية)
 # ---------------------------------------------------------
-@st.cache_data(ttl=15)
-def fetch_tickers_cloud_safe():
+@st.cache_data(ttl=10)
+def fetch_tickers_live():
     tickers = {}
-    fsyms = ",".join([info["fsym"] for info in SYMBOLS_MAP.values()])
-    url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={fsyms}&tsyms=USDT"
+    url = "https://api.binance.us/api/v3/ticker/24hr"
     
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=8)
+        res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            raw_data = data.get("RAW", {})
+            data_dict = {item['symbol']: item for item in data if isinstance(item, dict)}
             for display_name, info in SYMBOLS_MAP.items():
-                fsym = info["fsym"]
-                if fsym in raw_data and "USDT" in raw_data[fsym]:
-                    coin_info = raw_data[fsym]["USDT"]
+                sym = info["symbol_us"]
+                if sym in data_dict:
                     tickers[display_name] = {
-                        'price': float(coin_info.get("PRICE", info["base_price"])),
-                        'change': float(coin_info.get("CHANGEPCT24HOUR", 0.0))
+                        'price': float(data_dict[sym]['lastPrice']),
+                        'change': float(data_dict[sym]['priceChangePercent'])
                     }
-                else:
-                    tickers[display_name] = {'price': info["base_price"], 'change': 0.0}
+            if len(tickers) == len(SYMBOLS_MAP):
+                return tickers
+    except Exception:
+        pass
+
+    # Backup: CoinGecko Free API
+    try:
+        ids = ",".join([info["cg_id"] for info in SYMBOLS_MAP.values()])
+        cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+        res = requests.get(cg_url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            for display_name, info in SYMBOLS_MAP.items():
+                cid = info["cg_id"]
+                if cid in data:
+                    tickers[display_name] = {
+                        'price': float(data[cid].get('usd', 0.0)),
+                        'change': float(data[cid].get('usd_24h_change', 0.0))
+                    }
             return tickers
     except Exception:
         pass
 
-    for display_name, info in SYMBOLS_MAP.items():
-        tickers[display_name] = {'price': info["base_price"], 'change': 0.0}
-    return tickers
+    return {k: {'price': 0.0, 'change': 0.0} for k in SYMBOLS_MAP.keys()}
 
-@st.cache_data(ttl=20)
-def fetch_market_data_cloud_safe(display_symbol, tf):
-    fsym = SYMBOLS_MAP[display_symbol]["fsym"]
-    base_p = SYMBOLS_MAP[display_symbol]["base_price"]
-    headers = {"User-Agent": "Mozilla/5.0"}
+@st.cache_data(ttl=15)
+def fetch_market_data_live(display_symbol, tf):
+    sym_us = SYMBOLS_MAP[display_symbol]["symbol_us"]
+    url = f"https://api.binance.us/api/v3/klines?symbol={sym_us}&interval={tf}&limit=120"
     
-    tf_mapping = {
-        "5m": ("histominute", 5, "5min"),
-        "15m": ("histominute", 15, "15min"),
-        "1h": ("histohour", 1, "1h"),
-        "4h": ("histohour", 4, "4h"),
-        "1d": ("histoday", 1, "1D")
-    }
-    
-    endpoint, aggregate, pd_freq = tf_mapping.get(tf, ("histohour", 1, "1h"))
-    url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?fsym={fsym}&tsym=USDT&limit=120&aggregate={aggregate}"
-    
-    df = None
     try:
-        res = requests.get(url, headers=headers, timeout=8)
+        res = requests.get(url, timeout=6)
         if res.status_code == 200:
-            data = res.json()
-            candle_data = data.get("Data", {}).get("Data", [])
-            if candle_data:
-                df = pd.DataFrame(candle_data)
-                df['timestamp'] = pd.to_datetime(df['time'], unit='s')
-                df.rename(columns={'volumeto': 'volume'}, inplace=True)
-                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = df[col].astype(float)
+            raw_data = res.json()
+            df = pd.DataFrame(raw_data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'qav', 'num_trades', 'tb_base', 'tb_quote', 'ignore'
+            ])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+        else:
+            raise Exception("Klines request failed")
     except Exception:
-        pass
-
-    # Safe Fallback in case of network issues
-    if df is None or df.empty:
-        now = pd.Timestamp.now()
-        timestamps = pd.date_range(end=now, periods=120, freq=pd_freq)
-        df = pd.DataFrame({
-            'timestamp': timestamps,
-            'open': [base_p] * 120,
-            'high': [base_p * 1.005] * 120,
-            'low': [base_p * 0.995] * 120,
-            'close': [base_p] * 120,
-            'volume': [1000.0] * 120
-        })
+        # Fallback Coingecko Market Chart OHLC
+        cid = SYMBOLS_MAP[display_symbol]["cg_id"]
+        cg_ohlc_url = f"https://api.coingecko.com/api/v3/coins/{cid}/ohlc?vs_currency=usd&days=1"
+        res = requests.get(cg_ohlc_url, timeout=6)
+        raw_data = res.json()
+        df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['volume'] = 1000.0
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = df[col].astype(float)
 
     # Anchored VWAP
     df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
@@ -195,7 +191,7 @@ def fetch_market_data_cloud_safe(display_symbol, tf):
 st.title("⚡ AliQuantFund (Control Center)")
 st.caption(f"تحديث أخير: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-tickers_data = fetch_tickers_cloud_safe()
+tickers_data = fetch_tickers_live()
 cols = st.columns(4)
 
 for i, sym in enumerate(SYMBOLS_MAP.keys()):
@@ -207,7 +203,7 @@ for i, sym in enumerate(SYMBOLS_MAP.keys()):
 
 st.markdown("---")
 
-df = fetch_market_data_cloud_safe(selected_display_symbol, timeframe)
+df = fetch_market_data_live(selected_display_symbol, timeframe)
 
 col_chart, col_signal = st.columns([2.2, 1])
 
