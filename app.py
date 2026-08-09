@@ -49,6 +49,16 @@ def send_telegram_alert(message):
 if "last_signal" not in st.session_state:
     st.session_state.last_signal = {}
 
+# دالة مخصصة لإنشاء اتصال Binance يتجاوز القيود الجغرافية لخوادم السحابة
+def get_binance_exchange():
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot'}
+    })
+    # تغيير الـ Endpoint لتجنب حظر IP السحابة في الولايات المتحدة
+    exchange.urls['api']['public'] = 'https://data.binance.com/api/v3'
+    return exchange
+
 # ---------------------------------------------------------
 # 3. الشريط الجانبي (Sidebar)
 # ---------------------------------------------------------
@@ -85,7 +95,7 @@ if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
 # ---------------------------------------------------------
 @st.cache_data(ttl=10)
 def fetch_market_data(symbol, tf):
-    exchange = ccxt.binance()
+    exchange = get_binance_exchange()
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=120)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -117,7 +127,7 @@ def fetch_market_data(symbol, tf):
 
 @st.cache_data(ttl=10)
 def fetch_tickers():
-    exchange = ccxt.binance()
+    exchange = get_binance_exchange()
     tickers = {}
     for sym in SYMBOLS:
         try:
@@ -126,7 +136,7 @@ def fetch_tickers():
                 'price': ticker['last'],
                 'change': ticker['percentage']
             }
-        except:
+        except Exception:
             tickers[sym] = {'price': 0.0, 'change': 0.0}
     return tickers
 
@@ -275,11 +285,11 @@ with risk_col1:
     entry_p = st.number_input("سعر الدخول ($):", min_value=0.00001, value=float(last_price), format="%.4f")
     
     if trade_type == "Long 🟢":
-        default_sl = entry_p * 0.98  # 2% أسفل السعر
-        default_tp = entry_p * 1.04  # 4% أعلى السعر
+        default_sl = entry_p * 0.98
+        default_tp = entry_p * 1.04
     else:
-        default_sl = entry_p * 1.02  # 2% أعلى السعر
-        default_tp = entry_p * 0.96  # 4% أسفل السعر
+        default_sl = entry_p * 1.02
+        default_tp = entry_p * 0.96
         
     stop_loss = st.number_input("سعر وقف الخسارة (Stop Loss $):", min_value=0.00001, value=float(default_sl), format="%.4f")
     take_profit = st.number_input("سعر أخذ الأرباح (Take Profit $):", min_value=0.00001, value=float(default_tp), format="%.4f")
