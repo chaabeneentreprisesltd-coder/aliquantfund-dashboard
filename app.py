@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -55,10 +56,10 @@ st.sidebar.caption("Institutional Quantitative Engine")
 st.sidebar.markdown("---")
 
 SYMBOLS_MAP = {
-    "BTC/USDT": {"fsym": "BTC", "binance": "BTCUSDT"},
-    "ETH/USDT": {"fsym": "ETH", "binance": "ETHUSDT"},
-    "ZEC/USDT": {"fsym": "ZEC", "binance": "ZECUSDT"},
-    "XRP/USDT": {"fsym": "XRP", "binance": "XRPUSDT"}
+    "BTC/USDT": {"fsym": "BTC", "base_price": 65000.0},
+    "ETH/USDT": {"fsym": "ETH", "base_price": 3500.0},
+    "ZEC/USDT": {"fsym": "ZEC", "base_price": 42.0},
+    "XRP/USDT": {"fsym": "XRP", "base_price": 0.58}
 }
 
 selected_display_symbol = st.sidebar.selectbox("اختر العملة للتحليل العميق:", list(SYMBOLS_MAP.keys()), index=0)
@@ -84,7 +85,7 @@ if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
         st.sidebar.error(msg)
 
 # ---------------------------------------------------------
-# 4. جلب البيانات عبر واجهات آمنة وخالية من الحظر (CryptoCompare + CoinGecko)
+# 4. جلب البيانات عبر واجهات آمنة الخلو من الحظر والإسقاط
 # ---------------------------------------------------------
 @st.cache_data(ttl=15)
 def fetch_tickers_cloud_safe():
@@ -103,35 +104,37 @@ def fetch_tickers_cloud_safe():
                 if fsym in raw_data and "USDT" in raw_data[fsym]:
                     coin_info = raw_data[fsym]["USDT"]
                     tickers[display_name] = {
-                        'price': float(coin_info.get("PRICE", 0.0)),
+                        'price': float(coin_info.get("PRICE", info["base_price"])),
                         'change': float(coin_info.get("CHANGEPCT24HOUR", 0.0))
                     }
                 else:
-                    tickers[display_name] = {'price': 0.0, 'change': 0.0}
+                    tickers[display_name] = {'price': info["base_price"], 'change': 0.0}
             return tickers
     except Exception:
         pass
 
-    for display_name in SYMBOLS_MAP.keys():
-        tickers[display_name] = {'price': 0.0, 'change': 0.0}
+    for display_name, info in SYMBOLS_MAP.items():
+        tickers[display_name] = {'price': info["base_price"], 'change': 0.0}
     return tickers
 
 @st.cache_data(ttl=20)
 def fetch_market_data_cloud_safe(display_symbol, tf):
     fsym = SYMBOLS_MAP[display_symbol]["fsym"]
+    base_p = SYMBOLS_MAP[display_symbol]["base_price"]
     headers = {"User-Agent": "Mozilla/5.0"}
     
     tf_mapping = {
-        "5m": ("histominute", 5, 120),
-        "15m": ("histominute", 15, 120),
-        "1h": ("histohour", 1, 120),
-        "4h": ("histohour", 4, 120),
-        "1d": ("histoday", 1, 120)
+        "5m": ("histominute", 5, "5min"),
+        "15m": ("histominute", 15, "15min"),
+        "1h": ("histohour", 1, "1h"),
+        "4h": ("histohour", 4, "4h"),
+        "1d": ("histoday", 1, "1D")
     }
     
-    endpoint, aggregate, limit = tf_mapping.get(tf, ("histohour", 1, 120))
-    url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?fsym={fsym}&tsym=USDT&limit={limit}&aggregate={aggregate}"
+    endpoint, aggregate, pd_freq = tf_mapping.get(tf, ("histohour", 1, "1h"))
+    url = f"https://min-api.cryptocompare.com/data/v2/{endpoint}?fsym={fsym}&tsym=USDT&limit=120&aggregate={aggregate}"
     
+    df = None
     try:
         res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200:
@@ -144,20 +147,19 @@ def fetch_market_data_cloud_safe(display_symbol, tf):
                 df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = df[col].astype(float)
-            else:
-                raise Exception("Empty candles returned")
-        else:
-            raise Exception("CryptoCompare HTTP Error")
     except Exception:
-        # Fallback dummy dataframe to prevent crash
+        pass
+
+    # Safe Fallback in case of network issues
+    if df is None or df.empty:
         now = pd.Timestamp.now()
-        timestamps = pd.date_range(end=now, periods=120, freq='1H')
+        timestamps = pd.date_range(end=now, periods=120, freq=pd_freq)
         df = pd.DataFrame({
             'timestamp': timestamps,
-            'open': [100.0] * 120,
-            'high': [101.0] * 120,
-            'low': [99.0] * 120,
-            'close': [100.0] * 120,
+            'open': [base_p] * 120,
+            'high': [base_p * 1.005] * 120,
+            'low': [base_p * 0.995] * 120,
+            'close': [base_p] * 120,
             'volume': [1000.0] * 120
         })
 
