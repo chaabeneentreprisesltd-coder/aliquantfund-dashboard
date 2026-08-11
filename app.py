@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from datetime import datetime
 
 # ==========================================
 # 1. إعدادات الصفحة والتصميم العامة
@@ -15,7 +14,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# تخصيص المظهر باللغة العربية والأنماط البصرية
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap');
@@ -30,112 +28,129 @@ st.markdown("""
         border-radius: 10px;
         border: 1px solid #2a2e39;
     }
-    .metric-card {
-        background-color: #131722;
-        border-radius: 10px;
-        padding: 20px;
-        border: 1px solid #2a2e39;
-        margin-bottom: 15px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. محرك جلب البيانات والحسابات الكمية
+# 2. محرك جلب البيانات الذكي (محصن ضد الحظر)
 # ==========================================
 
 TIMEFRAME_WEIGHTS = {
-    '1d': 0.35,   # الاتجاه العام والسيولة الكبرى
-    '4h': 0.25,   # الهيكل الرئيسي والدعوم/المقاومات
-    '1h': 0.20,   # الزخم المحلي
-    '15m': 0.12,  # التهيؤ للدخول
-    '5m': 0.08    # التوقيت الدقيق
+    '1d': 0.35,
+    '4h': 0.25,
+    '1h': 0.20,
+    '15m': 0.12,
+    '5m': 0.08
 }
 
-@st.cache_data(ttl=30)
-def fetch_binance_klines(symbol="BTCUSDT", interval="5m", limit=150):
-    """جلب بيانات الشموع مباشرة من واجهة بينانس العامة"""
+# تحويل الفريمات لصيغة Bybit الاحتياطية
+BYBIT_TF_MAP = {
+    '5m': '5',
+    '15m': '15',
+    '1h': '60',
+    '4h': '240',
+    '1d': 'D'
+}
+
+@st.cache_data(ttl=20)
+def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
+    """دالة ذكية تحاول جلب البيانات من Binance وتتحول لـ Bybit عند وجود حظر 451"""
     formatted_symbol = symbol.replace("/", "").upper()
-    url = f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}"
-    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+
+    # المحاولة الأولى: سيرفرات Binance البديلة
+    binance_endpoints = [
+        f"https://api1.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+        f"https://api3.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+        f"https://data-api.binance.vision/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}"
+    ]
+
+    for url in binance_endpoints:
+        try:
+            res = requests.get(url, headers=headers, timeout=4)
+            if res.status_code == 200:
+                data = res.json()
+                df = pd.DataFrame(data, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'
+                ])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df
+        except:
+            continue
+
+    # المحاولة الثانية (Backup): خوادم Bybit العمالة عالمياً دون حظر
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        df = pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'number_of_trades',
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ])
-        
-        # تحويل أنواع البيانات
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = df[col].astype(float)
-            
-        return df
+        bybit_tf = BYBIT_TF_MAP.get(interval, '5')
+        bybit_url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval={bybit_tf}&limit={limit}"
+        res = requests.get(bybit_url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            result = res.json().get('result', {}).get('list', [])
+            if result:
+                # Bybit ترجع البيانات بشكل معكوس (أحدث شمعة أولاً)
+                df = pd.DataFrame(result, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                df = df.iloc[::-1].reset_index(drop=True)
+                df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df[col] = df[col].astype(float)
+                return df
     except Exception as e:
-        st.error(f"خطأ في جلب البيانات للزوج {symbol} على فريم {interval}: {e}")
-        return None
+        pass
+
+    return None
 
 def calculate_indicators(df):
-    """حساب المؤشرات الفنية والكمية الأساسية"""
+    """حساب المؤشرات الكمية"""
     if df is None or len(df) < 52:
         return df
 
-    # 1. Anchored VWAP
+    # Anchored VWAP
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
     df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['volume'].cumsum()
     
-    # 2. Ichimoku Cloud System
-    # Tenkan-sen (9)
+    # Ichimoku Cloud System
     df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
-    # Kijun-sen (26)
     df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
-    # Senkou Span A
     df['span_a'] = ((df['tenkan'] + df['kijun']) / 2).shift(26)
-    # Senkou Span B (52)
     df['span_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
     
-    # 3. Volume Moving Average (20)
+    # Volume Ratio
     df['vol_ma'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = np.where(df['vol_ma'] > 0, df['volume'] / df['vol_ma'], 1.0)
     
     return df
 
 def calculate_single_score(df):
-    """حساب التقييم المركب (0-100) لإطار زمني واحد"""
+    """حساب النتيجة الكمية (0-100)"""
     if df is None or len(df) < 52:
         return 50
 
     latest = df.iloc[-1]
     score = 50
     
-    # VWAP Condition
     if latest['close'] > latest['vwap']:
         score += 15
     else:
         score -= 15
         
-    # Ichimoku Cloud Condition
     if pd.notna(latest['span_a']) and pd.notna(latest['span_b']):
         cloud_max = max(latest['span_a'], latest['span_b'])
         cloud_min = min(latest['span_a'], latest['span_b'])
-        
         if latest['close'] > cloud_max:
             score += 15
         elif latest['close'] < cloud_min:
             score -= 15
             
-    # Tenkan / Kijun Cross
     if pd.notna(latest['tenkan']) and pd.notna(latest['kijun']):
         if latest['tenkan'] > latest['kijun']:
             score += 10
         else:
             score -= 10
             
-    # Volume Surge
     if latest['vol_ratio'] > 1.20:
         if latest['close'] > latest['open']:
             score += 10
@@ -145,12 +160,12 @@ def calculate_single_score(df):
     return int(np.clip(score, 0, 100))
 
 def get_global_multi_tf_analysis(symbol):
-    """حساب التوصية العامة الموحدة المدمجة عبر الفريمات الخمسة"""
+    """حساب التوصية العامة الشاملة الموحدة"""
     tf_scores = {}
     weighted_sum = 0.0
     
     for tf, weight in TIMEFRAME_WEIGHTS.items():
-        df_raw = fetch_binance_klines(symbol, interval=tf)
+        df_raw = fetch_klines_data(symbol, interval=tf)
         df_calc = calculate_indicators(df_raw)
         score = calculate_single_score(df_calc)
         
@@ -185,7 +200,7 @@ def get_global_multi_tf_analysis(symbol):
     }
 
 # ==========================================
-# 3. القائمة الجانبية (Sidebar & Controls)
+# 3. القائمة الجانبية (Sidebar)
 # ==========================================
 
 st.sidebar.title("⚡ AliQuantFund")
@@ -198,7 +213,7 @@ selected_symbol = st.sidebar.selectbox(
 )
 
 selected_tf = st.sidebar.selectbox(
-    "الإطار الزمني للرسم البياني (Timeframe):",
+    "الإطار الزمني للرسم البياني:",
     ["5m", "15m", "1h", "4h", "1d"]
 )
 
@@ -209,12 +224,12 @@ capital = st.sidebar.number_input("رأس المال الإجمالي ($):", val
 risk_pct = st.sidebar.number_input("نسبة المخاطرة (%):", value=2.0, step=0.5)
 
 # ==========================================
-# 4. الواجهة الرئيسية (Main Dashboard)
+# 4. الواجهة الرئيسية
 # ==========================================
 
 st.title(f"📊 التحليل الكمي المدمج: {selected_symbol}")
 
-# --- القسم الأول: التوصية العامة الموحدة (Global Master Recommendation) ---
+# --- التوصية العامة الموحدة ---
 st.markdown("### 🌐 التوصية العامة الموحدة (Multi-Timeframe Master Confluence)")
 
 global_res = get_global_multi_tf_analysis(selected_symbol)
@@ -238,8 +253,8 @@ with g_col2:
 
 st.markdown("---")
 
-# --- القسم الثاني: تحليل الفريم المحدد والشارت ---
-df_data = fetch_binance_klines(selected_symbol, interval=selected_tf)
+# --- الشارت والتحليل الفردي ---
+df_data = fetch_klines_data(selected_symbol, interval=selected_tf)
 df_calc = calculate_indicators(df_data)
 
 if df_calc is not None and not df_calc.empty:
@@ -256,7 +271,7 @@ if df_calc is not None and not df_calc.empty:
         st.write(f"**التقييم الكمي للفريم:** `{single_score}/100`")
         
         if single_score >= 65:
-            st.success("🔴 التوصية: **Strong Long**")
+            st.success("🟢 التوصية: **Strong Long**")
         elif single_score <= 35:
             st.error("🔴 التوصية: **Strong Short**")
         else:
@@ -267,14 +282,12 @@ if df_calc is not None and not df_calc.empty:
         st.write(f"• **Anchored VWAP:** `${latest['vwap']:.2f}`")
         st.write(f"• **نسبة الزخم الحجمي:** `{latest['vol_ratio']:.2f}x`")
         
-        # حاسبة أسعار الدخول والستوب
         st.markdown("---")
         st.markdown("#### 🔢 الإدارة العددية للصفقة")
         entry_price = st.number_input("سعر الدخول:", value=float(latest['close']))
         sl_price = st.number_input("وقف الخسارة (SL):", value=float(latest['vwap']))
         tp_price = st.number_input("أخذ الأرباح (TP):", value=float(entry_price + (abs(entry_price - sl_price) * 2)))
         
-        # معادلات حاسبة المخاطر
         risk_amount = capital * (risk_pct / 100)
         sl_distance = abs(entry_price - sl_price)
         
@@ -289,10 +302,8 @@ if df_calc is not None and not df_calc.empty:
             st.caption(f"• **نسبة العائد/المخاطرة:** `1:{rr_ratio:.2f}`")
 
     with col_chart:
-        # رسم الشارت التفاعلي باستخدام Plotly
         fig = go.Figure()
         
-        # الشموع اليابانية
         fig.add_trace(go.Candlestick(
             x=df_calc['timestamp'],
             open=df_calc['open'],
@@ -302,14 +313,12 @@ if df_calc is not None and not df_calc.empty:
             name='Price'
         ))
         
-        # خط VWAP
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['vwap'],
             mode='lines', name='Anchored VWAP',
             line=dict(color='gold', width=2)
         ))
         
-        # خطوط الإيشيموكو
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['tenkan'],
             mode='lines', name='Tenkan-sen',
@@ -333,5 +342,5 @@ if df_calc is not None and not df_calc.empty:
         st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption(" AliQuantFund Engine v1.5 | All Quantitative Rights Reserved")
+st.caption("⚡ AliQuantFund Engine v1.6 | All Quantitative Rights Reserved")
 
