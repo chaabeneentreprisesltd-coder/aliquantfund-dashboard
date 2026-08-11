@@ -1,336 +1,337 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import requests
-import time
+import plotly.graph_objects as go
 from datetime import datetime
 
-# ---------------------------------------------------------
-# 1. تهيئة إعدادات الصفحة
-# ---------------------------------------------------------
+# ==========================================
+# 1. إعدادات الصفحة والتصميم العامة
+# ==========================================
 st.set_page_config(
-    page_title="AliQuantFund | Quant Dashboard",
+    page_title="AliQuantFund | Institutional Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# بيانات البوت المثبتة
-TELEGRAM_BOT_TOKEN = "8766369440:AAHNpsegmHzQCxWdELXsiR8PUOyj_jPMV-g"
-TELEGRAM_CHAT_ID = "6852370388"
-
-def send_telegram_alert(message):
-    token = TELEGRAM_BOT_TOKEN.strip().replace(" ", "")
-    chat_id = TELEGRAM_CHAT_ID.strip().replace(" ", "")
-    
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
+# تخصيص المظهر باللغة العربية والأنماط البصرية
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap');
+    html, body, [class*="css"] {
+        font-family: 'Tajawal', sans-serif;
+        direction: rtl;
+        text-align: right;
     }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200 and response.json().get("ok"):
-            return True, "تم إرسال التنبيه بنجاح إلى تليجرام"
-        else:
-            return False, "فشل إرسال التنبيه إلى تليجرام"
-    except Exception as e:
-        return False, f"خطأ في الاتصال: {e}"
+    .stMetric {
+        background-color: #1e222d;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #2a2e39;
+    }
+    .metric-card {
+        background-color: #131722;
+        border-radius: 10px;
+        padding: 20px;
+        border: 1px solid #2a2e39;
+        margin-bottom: 15px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# 2. إدارة ذاكرة النظام لتتبع الإشارات لجميع العملات
-# ---------------------------------------------------------
-if "last_signal" not in st.session_state:
-    st.session_state.last_signal = {}
+# ==========================================
+# 2. محرك جلب البيانات والحسابات الكمية
+# ==========================================
 
-# ---------------------------------------------------------
-# 3. الشريط الجانبي (Sidebar)
-# ---------------------------------------------------------
-st.sidebar.title("⚡ AliQuantFund")
-st.sidebar.caption("Institutional Quantitative Engine")
-
-st.sidebar.markdown("---")
-
-SYMBOLS_MAP = {
-    "BTC/USDT": {"cg_id": "bitcoin", "symbol_us": "BTCUSDT"},
-    "ETH/USDT": {"cg_id": "ethereum", "symbol_us": "ETHUSDT"},
-    "ZEC/USDT": {"cg_id": "zcash", "symbol_us": "ZECUSDT"},
-    "XRP/USDT": {"cg_id": "ripple", "symbol_us": "XRPUSDT"}
+TIMEFRAME_WEIGHTS = {
+    '1d': 0.35,   # الاتجاه العام والسيولة الكبرى
+    '4h': 0.25,   # الهيكل الرئيسي والدعوم/المقاومات
+    '1h': 0.20,   # الزخم المحلي
+    '15m': 0.12,  # التهيؤ للدخول
+    '5m': 0.08    # التوقيت الدقيق
 }
 
-selected_display_symbol = st.sidebar.selectbox("اختر العملة للتحليل العميق:", list(SYMBOLS_MAP.keys()), index=0)
-
-timeframe = st.sidebar.selectbox("الإطار الزمني (Timeframe):", ["5m", "15m", "1h", "4h", "1d"], index=2)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔄 إعدادات التحديث ومراقبة السحابة")
-auto_refresh = st.sidebar.checkbox("تفعيل التحديث التلقائي ومراقبة كل الأزواج", value=True)
-refresh_seconds = st.sidebar.slider("معدل التحديث (بالثواني):", min_value=15, max_value=120, value=30, step=5)
-
-auto_alerts_enabled = st.sidebar.toggle("🚨 تفعيل التنبيهات الآلية الشاملة", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎛️ اختيارات التنبيه اليدوي")
-
-if st.sidebar.button("🔔 اختبار إرسال تنبيه تجريبي"):
-    test_msg = f"⚡ *AliQuantFund - Multi-Asset Scanner Test*\n\nالعملة: `{selected_display_symbol}`\nالإطار الزمني: `{timeframe}`\nالحالة: الاتصال الشامل بنظام التنبيهات نشط 🚀"
-    success, msg = send_telegram_alert(test_msg)
-    if success:
-        st.sidebar.success(msg)
-    else:
-        st.sidebar.error(msg)
-
-# ---------------------------------------------------------
-# 4. جلب البيانات من Binance.US / CoinGecko
-# ---------------------------------------------------------
-@st.cache_data(ttl=10)
-def fetch_tickers_live():
-    tickers = {}
-    url = "https://api.binance.us/api/v3/ticker/24hr"
+@st.cache_data(ttl=30)
+def fetch_binance_klines(symbol="BTCUSDT", interval="5m", limit=150):
+    """جلب بيانات الشموع مباشرة من واجهة بينانس العامة"""
+    formatted_symbol = symbol.replace("/", "").upper()
+    url = f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}"
     
     try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            data_dict = {item['symbol']: item for item in data if isinstance(item, dict)}
-            for display_name, info in SYMBOLS_MAP.items():
-                sym = info["symbol_us"]
-                if sym in data_dict:
-                    tickers[display_name] = {
-                        'price': float(data_dict[sym]['lastPrice']),
-                        'change': float(data_dict[sym]['priceChangePercent'])
-                    }
-            if len(tickers) == len(SYMBOLS_MAP):
-                return tickers
-    except Exception:
-        pass
-
-    try:
-        ids = ",".join([info["cg_id"] for info in SYMBOLS_MAP.values()])
-        cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
-        res = requests.get(cg_url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            for display_name, info in SYMBOLS_MAP.items():
-                cid = info["cg_id"]
-                if cid in data:
-                    tickers[display_name] = {
-                        'price': float(data[cid].get('usd', 0.0)),
-                        'change': float(data[cid].get('usd_24h_change', 0.0))
-                    }
-            return tickers
-    except Exception:
-        pass
-
-    return {k: {'price': 0.0, 'change': 0.0} for k in SYMBOLS_MAP.keys()}
-
-@st.cache_data(ttl=15)
-def fetch_market_data_live(display_symbol, tf):
-    sym_us = SYMBOLS_MAP[display_symbol]["symbol_us"]
-    url = f"https://api.binance.us/api/v3/klines?symbol={sym_us}&interval={tf}&limit=120"
-    
-    try:
-        res = requests.get(url, timeout=6)
-        if res.status_code == 200:
-            raw_data = res.json()
-            df = pd.DataFrame(raw_data, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'qav', 'num_trades', 'tb_base', 'tb_quote', 'ignore'
-            ])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
-        else:
-            raise Exception("Klines request failed")
-    except Exception:
-        cid = SYMBOLS_MAP[display_symbol]["cg_id"]
-        cg_ohlc_url = f"https://api.coingecko.com/api/v3/coins/{cid}/ohlc?vs_currency=usd&days=1"
-        res = requests.get(cg_ohlc_url, timeout=6)
-        raw_data = res.json()
-        df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close'])
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        df = pd.DataFrame(data, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        
+        # تحويل أنواع البيانات
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['volume'] = 1000.0
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
+            
+        return df
+    except Exception as e:
+        st.error(f"خطأ في جلب البيانات للزوج {symbol} على فريم {interval}: {e}")
+        return None
 
-    # Indicators calculation
-    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
-    df['vp'] = df['typical_price'] * df['volume']
-    cum_vol = df['volume'].cumsum()
-    df['vwap'] = np.where(cum_vol > 0, df['vp'].cumsum() / cum_vol, df['close'])
+def calculate_indicators(df):
+    """حساب المؤشرات الفنية والكمية الأساسية"""
+    if df is None or len(df) < 52:
+        return df
+
+    # 1. Anchored VWAP
+    df['tp'] = (df['high'] + df['low'] + df['close']) / 3
+    df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['volume'].cumsum()
     
-    nine_high = df['high'].rolling(window=9).max()
-    nine_low = df['low'].rolling(window=9).min()
-    df['tenkan_sen'] = (nine_high + nine_low) / 2
-
-    period26_high = df['high'].rolling(window=26).max()
-    period26_low = df['low'].rolling(window=26).min()
-    df['kijun_sen'] = (period26_high + period26_low) / 2
-
-    df['senkou_span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
-
-    period52_high = df['high'].rolling(window=52).max()
-    period52_low = df['low'].rolling(window=52).min()
-    df['senkou_span_b'] = ((period52_high + period52_low) / 2).shift(26)
+    # 2. Ichimoku Cloud System
+    # Tenkan-sen (9)
+    df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+    # Kijun-sen (26)
+    df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+    # Senkou Span A
+    df['span_a'] = ((df['tenkan'] + df['kijun']) / 2).shift(26)
+    # Senkou Span B (52)
+    df['span_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
     
-    df['vol_ma'] = df['volume'].rolling(window=20).mean()
+    # 3. Volume Moving Average (20)
+    df['vol_ma'] = df['volume'].rolling(20).mean()
+    df['vol_ratio'] = np.where(df['vol_ma'] > 0, df['volume'] / df['vol_ma'], 1.0)
+    
     return df
 
-def calculate_quant_score(df):
-    last_price = df['close'].iloc[-1]
-    last_vwap = df['vwap'].iloc[-1]
-    last_tenkan = df['tenkan_sen'].iloc[-1] if not pd.isna(df['tenkan_sen'].iloc[-1]) else last_price
-    last_kijun = df['kijun_sen'].iloc[-1] if not pd.isna(df['kijun_sen'].iloc[-1]) else last_price
-    span_a = df['senkou_span_a'].iloc[-1] if not pd.isna(df['senkou_span_a'].iloc[-1]) else last_price
-    span_b = df['senkou_span_b'].iloc[-1] if not pd.isna(df['senkou_span_b'].iloc[-1]) else last_price
-    last_vol = df['volume'].iloc[-1]
-    avg_vol = df['vol_ma'].iloc[-1] if not pd.isna(df['vol_ma'].iloc[-1]) else last_vol
-    
+def calculate_single_score(df):
+    """حساب التقييم المركب (0-100) لإطار زمني واحد"""
+    if df is None or len(df) < 52:
+        return 50
+
+    latest = df.iloc[-1]
     score = 50
-    if last_price > last_vwap: score += 15
-    else: score -= 15
     
-    cloud_max = max(span_a, span_b)
-    cloud_min = min(span_a, span_b)
-    if last_price > cloud_max: score += 15
-    elif last_price < cloud_min: score -= 15
-    
-    if last_tenkan > last_kijun: score += 10
-    else: score -= 10
-    
-    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
-    if vol_ratio > 1.2:
-        if last_price > df['open'].iloc[-1]: score += 10
-        else: score -= 10
+    # VWAP Condition
+    if latest['close'] > latest['vwap']:
+        score += 15
+    else:
+        score -= 15
         
-    score = int(np.clip(score, 0, 100))
-    
-    if score >= 65: rec = "🟢 Strong Long"
-    elif score <= 35: rec = "🔴 Strong Short"
-    else: rec = "🟡 No-Trade Regime"
-    
-    return score, rec, last_price, last_vwap, vol_ratio
-
-# ---------------------------------------------------------
-# 5. واجهة مركز القيادة والسيطرة
-# ---------------------------------------------------------
-st.title("⚡ AliQuantFund (Control Center)")
-st.caption(f"تحديث أخير: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-tickers_data = fetch_tickers_live()
-cols = st.columns(4)
-
-for i, sym in enumerate(SYMBOLS_MAP.keys()):
-    short_name = sym.split('/')[0]
-    p = tickers_data[sym]['price']
-    c = tickers_data[sym]['change']
-    delta_color = "normal" if c >= 0 else "inverse"
-    cols[i].metric(label=short_name, value=f"${p:,.2f}", delta=f"{c:+.2f}%", delta_color=delta_color)
-
-st.markdown("---")
-
-# ---------------------------------------------------------
-# 6. فاحص جميع الأصول الشامل (Multi-Asset Auto Scanner)
-# ---------------------------------------------------------
-if auto_alerts_enabled:
-    for sym_check in SYMBOLS_MAP.keys():
-        try:
-            df_check = fetch_market_data_live(sym_check, timeframe)
-            score_chk, rec_chk, price_chk, vwap_chk, vol_chk = calculate_quant_score(df_check)
-            prev_sig = st.session_state.last_signal.get(sym_check)
+    # Ichimoku Cloud Condition
+    if pd.notna(latest['span_a']) and pd.notna(latest['span_b']):
+        cloud_max = max(latest['span_a'], latest['span_b'])
+        cloud_min = min(latest['span_a'], latest['span_b'])
+        
+        if latest['close'] > cloud_max:
+            score += 15
+        elif latest['close'] < cloud_min:
+            score -= 15
             
-            if prev_sig != rec_chk:
-                st.session_state.last_signal[sym_check] = rec_chk
-                if prev_sig is not None:
-                    alert_text = (
-                        f"🚨 *تنبيه تغيير النظام الكمي - AliQuantFund*\n\n"
-                        f"📌 **الأصل:** `{sym_check}`\n"
-                        f"⏱️ **الإطار الزمني:** `{timeframe}`\n"
-                        f"🔄 **التغيير:** `{prev_sig}` ➡️ **{rec_chk}**\n"
-                        f"📊 **النتيجة الكمية (Score):** `{score_chk}/100`\n"
-                        f"💵 **السعر:** `${price_chk:,.2f}`\n"
-                        f"🎯 **VWAP:** `${vwap_chk:,.2f}`\n"
-                        f"⚡ **نسبة الفوليوم:** `{vol_chk:.2f}x`"
-                    )
-                    send_telegram_alert(alert_text)
-                    st.toast(f"تم إرسال تنبيه آلي لـ {sym_check}: {rec_chk}", icon="🚀")
-        except Exception:
-            pass
+    # Tenkan / Kijun Cross
+    if pd.notna(latest['tenkan']) and pd.notna(latest['kijun']):
+        if latest['tenkan'] > latest['kijun']:
+            score += 10
+        else:
+            score -= 10
+            
+    # Volume Surge
+    if latest['vol_ratio'] > 1.20:
+        if latest['close'] > latest['open']:
+            score += 10
+        elif latest['close'] < latest['open']:
+            score -= 10
+            
+    return int(np.clip(score, 0, 100))
 
-df = fetch_market_data_live(selected_display_symbol, timeframe)
-score, recommendation, last_price, last_vwap, vol_ratio = calculate_quant_score(df)
-
-col_chart, col_signal = st.columns([2.2, 1])
-
-with col_chart:
-    st.subheader(f"📊 التحليل الكمي المدمج: {selected_display_symbol}")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['senkou_span_a'], mode='lines', line=dict(width=0.5, color='rgba(0, 230, 118, 0.5)'), name='Span A', showlegend=False))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['senkou_span_b'], mode='lines', line=dict(width=0.5, color='rgba(255, 82, 82, 0.5)'), fill='tonexty', fillcolor='rgba(0, 230, 118, 0.08)', name='Kumo Cloud'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['tenkan_sen'], mode='lines', line=dict(color='#29B6F6', width=1.5), name='Tenkan-sen'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['kijun_sen'], mode='lines', line=dict(color='#FF7043', width=1.5), name='Kijun-sen'))
-    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="السعر"))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['vwap'], mode='lines', name='Anchored VWAP', line=dict(color='#FFEB3B', width=2)))
-    fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10), height=480)
-    st.plotly_chart(fig, use_container_width=True)
-
-with col_signal:
-    st.subheader("🎯 بطاقة الإشارة الكمية المركبة")
-    st.info(f"الأصل: **{selected_display_symbol}**")
-    st.progress(score / 100)
-    st.caption(f"التقييم المركب (Composite Quant Score): **{score}/100**")
-    st.markdown(f"**التوصية:** {recommendation}")
-    st.markdown("---")
-    st.write(f"- السعر الحالي: `${last_price:,.2f}`")
-    st.write(f"- Anchored VWAP: `${last_vwap:,.2f}`")
-    st.write(f"- نسبة الزخم الحجمي: `{vol_ratio:.2f}x`")
-
-# ---------------------------------------------------------
-# 7. حاسبة إدارة المخاطر
-# ---------------------------------------------------------
-st.markdown("---")
-st.subheader("🛡️ حاسبة إدارة المخاطر وحجم الصفقة (Risk Calculator)")
-risk_col1, risk_col2 = st.columns(2)
-
-with risk_col1:
-    capital = st.number_input("رأس مال الحساب الإجمالي ($):", min_value=10.0, value=10000.0, step=500.0)
-    risk_pct = st.number_input("نسبة المخاطرة المقبولة (%):", min_value=0.1, max_value=10.0, value=1.0, step=0.5)
-    trade_type = st.radio("نوع اتجاه الصفقة:", ["Long 🟢", "Short 🔴"], horizontal=True)
-    entry_p = st.number_input("سعر الدخول ($):", min_value=0.00001, value=float(last_price), format="%.4f")
-    default_sl = entry_p * 0.98 if trade_type == "Long 🟢" else entry_p * 1.02
-    default_tp = entry_p * 1.04 if trade_type == "Long 🟢" else entry_p * 0.96
-    stop_loss = st.number_input("سعر وقف الخسارة (Stop Loss $):", min_value=0.00001, value=float(default_sl), format="%.4f")
-    take_profit = st.number_input("سعر أخذ الأرباح (Take Profit $):", min_value=0.00001, value=float(default_tp), format="%.4f")
-
-with risk_col2:
-    sl_distance = abs(entry_p - stop_loss)
-    tp_distance = abs(take_profit - entry_p)
-    if sl_distance > 0:
-        risk_amount = capital * (risk_pct / 100.0)
-        position_units = risk_amount / sl_distance
-        position_value = position_units * entry_p
-        rr_ratio = tp_distance / sl_distance
-        potential_profit = position_units * tp_distance
-        sl_pct = (sl_distance / entry_p) * 100
-        tp_pct = (tp_distance / entry_p) * 100
-        base_asset = selected_display_symbol.split('/')[0]
+def get_global_multi_tf_analysis(symbol):
+    """حساب التوصية العامة الموحدة المدمجة عبر الفريمات الخمسة"""
+    tf_scores = {}
+    weighted_sum = 0.0
+    
+    for tf, weight in TIMEFRAME_WEIGHTS.items():
+        df_raw = fetch_binance_klines(symbol, interval=tf)
+        df_calc = calculate_indicators(df_raw)
+        score = calculate_single_score(df_calc)
         
-        st.markdown("### 📊 نتائج إدارة المخاطر:")
-        st.error(f"⚠️ **أقصى خسارة مسموح بها:** `${risk_amount:,.2f}` (نسبة {risk_pct}%)")
-        st.info(f"🎯 **حجم الصفقة المطلوب:** `{position_units:,.4f}` {base_asset}")
-        st.write(f"- **القيمة الإجمالية للصفقة (Position Value):** `${position_value:,.2f}`")
-        st.write(f"- **نسبة العائد للمخاطرة (R:R Ratio):** `1:{rr_ratio:.2f}`")
-        st.write(f"- **الربح المتوقع:** `${potential_profit:,.2f}` (+{tp_pct:.2f}%)")
-        st.write(f"- **الخسارة عند ضرب الـ SL:** `${risk_amount:,.2f}` (-{sl_pct:.2f}%)")
+        tf_scores[tf] = score
+        weighted_sum += score * weight
+        
+    global_score = round(weighted_sum, 1)
+    d_score = tf_scores.get('1d', 50)
+    h4_score = tf_scores.get('4h', 50)
+    
+    if global_score >= 70 and d_score >= 60 and h4_score >= 60:
+        master_signal = "🟢 SUPER STRONG LONG"
+        status_desc = "توافق صاعد تام عبر الفريمات الكبرى والصغرى."
+    elif global_score <= 30 and d_score <= 40 and h4_score <= 40:
+        master_signal = "🔴 SUPER STRONG SHORT"
+        status_desc = "توافق هابط تام عبر الفريمات الكبرى والصغرى."
+    elif global_score >= 65 and (d_score < 50 or h4_score < 50):
+        master_signal = "⚠️ SCALP LONG (Counter-Trend)"
+        status_desc = "صعود قصير الأجل على الصغرى عكس اتجاه الفريم اليومي."
+    elif global_score <= 35 and (d_score > 50 or h4_score > 50):
+        master_signal = "⚠️ SCALP SHORT (Counter-Trend)"
+        status_desc = "هبوط قصير الأجل على الصغرى عكس اتجاه الفريم اليومي."
+    else:
+        master_signal = "🟡 NEUTRAL / CONFLICT"
+        status_desc = "تضارب بين الأطر الزمنية - يفضل عدم الدخول."
+        
+    return {
+        'global_score': global_score,
+        'master_signal': master_signal,
+        'status_desc': status_desc,
+        'tf_scores': tf_scores
+    }
 
-# ---------------------------------------------------------
-# 8. التحديث التلقائي
-# ---------------------------------------------------------
-if auto_refresh:
-    time.sleep(refresh_seconds)
-    st.rerun()
+# ==========================================
+# 3. القائمة الجانبية (Sidebar & Controls)
+# ==========================================
+
+st.sidebar.title("⚡ AliQuantFund")
+st.sidebar.caption("Institutional Quantitative Engine")
+st.sidebar.markdown("---")
+
+selected_symbol = st.sidebar.selectbox(
+    "اختر العملة للتحليل العميق:",
+    ["BTC/USDT", "ETH/USDT", "ZEC/USDT", "XRP/USDT"]
+)
+
+selected_tf = st.sidebar.selectbox(
+    "الإطار الزمني للرسم البياني (Timeframe):",
+    ["5m", "15m", "1h", "4h", "1d"]
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📐 حاسبة إدارة المخاطر")
+
+capital = st.sidebar.number_input("رأس المال الإجمالي ($):", value=100.0, step=10.0)
+risk_pct = st.sidebar.number_input("نسبة المخاطرة (%):", value=2.0, step=0.5)
+
+# ==========================================
+# 4. الواجهة الرئيسية (Main Dashboard)
+# ==========================================
+
+st.title(f"📊 التحليل الكمي المدمج: {selected_symbol}")
+
+# --- القسم الأول: التوصية العامة الموحدة (Global Master Recommendation) ---
+st.markdown("### 🌐 التوصية العامة الموحدة (Multi-Timeframe Master Confluence)")
+
+global_res = get_global_multi_tf_analysis(selected_symbol)
+
+g_col1, g_col2 = st.columns([1, 2])
+
+with g_col1:
+    st.metric(
+        label="التقييم المركب الموحد (Global Score)",
+        value=f"{global_res['global_score']} / 100",
+        delta=global_res['master_signal']
+    )
+    st.info(f"💡 **الحالة:** {global_res['status_desc']}")
+
+with g_col2:
+    st.write("📊 **درجات التقييم حسب الأطر الزمنية الخمسة:**")
+    tf_cols = st.columns(5)
+    for idx, (tf_key, sc) in enumerate(global_res['tf_scores'].items()):
+        color = "🟢" if sc >= 65 else ("🔴" if sc <= 35 else "🟡")
+        tf_cols[idx].metric(label=tf_key.upper(), value=f"{sc}", delta=color)
+
+st.markdown("---")
+
+# --- القسم الثاني: تحليل الفريم المحدد والشارت ---
+df_data = fetch_binance_klines(selected_symbol, interval=selected_tf)
+df_calc = calculate_indicators(df_data)
+
+if df_calc is not None and not df_calc.empty:
+    latest = df_calc.iloc[-1]
+    single_score = calculate_single_score(df_calc)
+    
+    col_chart, col_signal = st.columns([3, 1])
+    
+    with col_signal:
+        st.markdown("### 🎯 بطاقة الإشارة اللحظية")
+        st.write(f"**الأصل:** {selected_symbol} ({selected_tf})")
+        
+        st.progress(single_score / 100)
+        st.write(f"**التقييم الكمي للفريم:** `{single_score}/100`")
+        
+        if single_score >= 65:
+            st.success("🔴 التوصية: **Strong Long**")
+        elif single_score <= 35:
+            st.error("🔴 التوصية: **Strong Short**")
+        else:
+            st.warning("🟡 التوصية: **No-Trade Regime**")
+            
+        st.markdown("---")
+        st.write(f"• **السعر الحالي:** `${latest['close']:.2f}`")
+        st.write(f"• **Anchored VWAP:** `${latest['vwap']:.2f}`")
+        st.write(f"• **نسبة الزخم الحجمي:** `{latest['vol_ratio']:.2f}x`")
+        
+        # حاسبة أسعار الدخول والستوب
+        st.markdown("---")
+        st.markdown("#### 🔢 الإدارة العددية للصفقة")
+        entry_price = st.number_input("سعر الدخول:", value=float(latest['close']))
+        sl_price = st.number_input("وقف الخسارة (SL):", value=float(latest['vwap']))
+        tp_price = st.number_input("أخذ الأرباح (TP):", value=float(entry_price + (abs(entry_price - sl_price) * 2)))
+        
+        # معادلات حاسبة المخاطر
+        risk_amount = capital * (risk_pct / 100)
+        sl_distance = abs(entry_price - sl_price)
+        
+        if sl_distance > 0:
+            units = risk_amount / sl_distance
+            pos_value = units * entry_price
+            rr_ratio = abs(tp_price - entry_price) / sl_distance
+            
+            st.caption(f"• **المخاطرة بالدولار:** `${risk_amount:.2f}`")
+            st.caption(f"• **حجم الصفقة (Units):** `{units:.4f}`")
+            st.caption(f"• **قيمة العقد:** `${pos_value:.2f}`")
+            st.caption(f"• **نسبة العائد/المخاطرة:** `1:{rr_ratio:.2f}`")
+
+    with col_chart:
+        # رسم الشارت التفاعلي باستخدام Plotly
+        fig = go.Figure()
+        
+        # الشموع اليابانية
+        fig.add_trace(go.Candlestick(
+            x=df_calc['timestamp'],
+            open=df_calc['open'],
+            high=df_calc['high'],
+            low=df_calc['low'],
+            close=df_calc['close'],
+            name='Price'
+        ))
+        
+        # خط VWAP
+        fig.add_trace(go.Scatter(
+            x=df_calc['timestamp'], y=df_calc['vwap'],
+            mode='lines', name='Anchored VWAP',
+            line=dict(color='gold', width=2)
+        ))
+        
+        # خطوط الإيشيموكو
+        fig.add_trace(go.Scatter(
+            x=df_calc['timestamp'], y=df_calc['tenkan'],
+            mode='lines', name='Tenkan-sen',
+            line=dict(color='skyblue', width=1.5)
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=df_calc['timestamp'], y=df_calc['kijun'],
+            mode='lines', name='Kijun-sen',
+            line=dict(color='orange', width=1.5)
+        ))
+        
+        fig.update_layout(
+            title=f"شارت {selected_symbol} - {selected_tf}",
+            template="plotly_dark",
+            xaxis_rangeslider_visible=False,
+            height=600,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.caption(" AliQuantFund Engine v1.5 | All Quantitative Rights Reserved")
+
