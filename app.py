@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 # 1. إعدادات الصفحة والتصميم العامة
 # ==========================================
 st.set_page_config(
-    page_title="AliQuantFund | Institutional Engine",
+    page_title="AliQuantFund | Multi-VWAP Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -38,7 +38,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. محرك جلب البيانات الحركية والـ Open Interest
+# 2. محرك البيانات الحركية
 # ==========================================
 
 TIMEFRAME_WEIGHTS = {
@@ -59,7 +59,6 @@ BYBIT_TF_MAP = {
 
 @st.cache_data(ttl=20)
 def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
-    """جلب بيانات الشموع مباشرة"""
     formatted_symbol = symbol.replace("/", "").upper()
     headers = {'User-Agent': 'Mozilla/5.0'}
 
@@ -105,7 +104,6 @@ def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
 
 @st.cache_data(ttl=30)
 def fetch_open_interest(symbol="BTCUSDT", interval="5m", limit=30):
-    """جلب بيانات الفائدة المفتوحة Open Interest من Bybit Derivatives"""
     formatted_symbol = symbol.replace("/", "").upper()
     headers = {'User-Agent': 'Mozilla/5.0'}
     bybit_tf = BYBIT_TF_MAP.get(interval, '5m')
@@ -126,37 +124,77 @@ def fetch_open_interest(symbol="BTCUSDT", interval="5m", limit=30):
         pass
     return None
 
+# ==========================================
+# 3. حساب طبقات الـ VWAP الثلاث والـ ATR
+# ==========================================
+
 def calculate_indicators(df):
-    """حساب المؤشرات الكمية"""
     if df is None or len(df) < 52:
         return df
 
+    # 1. حساب مؤشر ATR (14) للتطبيب بالتذبذب
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean().bfill()
+
+    # السعر النموذجي والسيولة
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
-    df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['volume'].cumsum()
+    df['pv'] = df['tp'] * df['volume']
+
+    # 2. Session VWAP (إعادة الضبط يومياً)
+    df['date'] = df['timestamp'].dt.date
+    session_pv = df.groupby('date')['pv'].cumsum()
+    session_vol = df.groupby('date')['volume'].cumsum()
+    df['vwap_session'] = np.where(session_vol > 0, session_pv / session_vol, df['tp'])
+
+    # 3. Weekly VWAP (إعادة الضبط أسبوعياً)
+    df['week_year'] = df['timestamp'].dt.strftime('%Y-%U')
+    weekly_pv = df.groupby('week_year')['pv'].cumsum()
+    weekly_vol = df.groupby('week_year')['volume'].cumsum()
+    df['vwap_weekly'] = np.where(weekly_vol > 0, weekly_pv / weekly_vol, df['tp'])
+
+    # 4. Anchored VWAP (مثبت آلياً عند أدنى قاع محلي - Swing Low)
+    min_idx = df['low'].idxmin()
+    df_anchored = df.loc[min_idx:].copy()
+    anc_pv = (df_anchored['tp'] * df_anchored['volume']).cumsum()
+    anc_vol = df_anchored['volume'].cumsum()
     
+    df['vwap_anchored'] = np.nan
+    df.loc[min_idx:, 'vwap_anchored'] = np.where(anc_vol > 0, anc_pv / anc_vol, df_anchored['tp'])
+    df['vwap_anchored'] = df['vwap_anchored'].ffill().bfill()
+
+    # 5. Ichimoku Cloud System
     df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
     df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
     df['span_a'] = ((df['tenkan'] + df['kijun']) / 2).shift(26)
     df['span_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
     
+    # 6. Volume Ratio
     df['vol_ma'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = np.where(df['vol_ma'] > 0, df['volume'] / df['vol_ma'], 1.0)
     
     return df
 
 def calculate_single_score(df, df_oi=None):
-    """حساب التقييم المركب بدمج الـ Open Interest (0-100)"""
     if df is None or len(df) < 52:
         return 50
 
     latest = df.iloc[-1]
+    atr = max(latest['atr'], 1e-5) # تفادي القسمة على صفر
     score = 50
     
-    # 1. Anchored VWAP
-    if latest['close'] > latest['vwap']:
-        score += 15
-    else:
-        score -= 15
+    # 1. نظام المسافة عن الـ VWAP الموزون بالـ ATR (Max ±15 pts)
+    d_session = (latest['close'] - latest['vwap_session']) / atr
+    d_weekly = (latest['close'] - latest['vwap_weekly']) / atr
+    d_anchored = (latest['close'] - latest['vwap_anchored']) / atr
+    
+    delta_session = np.clip(d_session * 2.5, -5.0, 5.0)
+    delta_weekly = np.clip(d_weekly * 2.5, -5.0, 5.0)
+    delta_anchored = np.clip(d_anchored * 2.5, -5.0, 5.0)
+    
+    score += (delta_session + delta_weekly + delta_anchored)
         
     # 2. Ichimoku Cloud
     if pd.notna(latest['span_a']) and pd.notna(latest['span_b']):
@@ -181,7 +219,7 @@ def calculate_single_score(df, df_oi=None):
         elif latest['close'] < latest['open']:
             score -= 10
             
-    # 5. Open Interest Logic (المحرك الكمي الجديد للسيولة)
+    # 5. Open Interest Logic
     if df_oi is not None and len(df_oi) >= 10:
         latest_oi = df_oi.iloc[-1]['openInterest']
         prev_oi = df_oi.iloc[-10]['openInterest']
@@ -189,21 +227,20 @@ def calculate_single_score(df, df_oi=None):
         price_change_pct = ((df.iloc[-1]['close'] - df.iloc[-10]['close']) / df.iloc[-10]['close']) * 100
         oi_change_pct = ((latest_oi - prev_oi) / prev_oi) * 100
         
-        if oi_change_pct > 1.0:  # ارتفاع السيولة المفتوحة
+        if oi_change_pct > 1.0:
             if price_change_pct > 0:
-                score += 10  # Bullish Expansion (شراء مؤسسي جديد)
+                score += 10
             else:
-                score -= 10  # Bearish Expansion (بيع مؤسسي جديد)
-        elif oi_change_pct < -1.0: # انخفاض السيولة المفتوحة
+                score -= 10
+        elif oi_change_pct < -1.0:
             if price_change_pct > 0:
-                score -= 5   # Short Squeeze (صعود ناتج عن إغلاق شورت)
+                score -= 5
             else:
-                score += 5   # Long Liquidation (تصفية شراء / إجهاد هابط)
+                score += 5
             
     return int(np.clip(score, 0, 100))
 
 def get_global_multi_tf_analysis(symbol):
-    """حساب التوصية العامة الموحدة"""
     tf_scores = {}
     tf_vwaps = {}
     weighted_sum = 0.0
@@ -217,7 +254,7 @@ def get_global_multi_tf_analysis(symbol):
         
         tf_scores[tf] = score
         if df_calc is not None and not df_calc.empty:
-            tf_vwaps[tf] = df_calc.iloc[-1]['vwap']
+            tf_vwaps[tf] = df_calc.iloc[-1]['vwap_session']
         else:
             tf_vwaps[tf] = 0.0
             
@@ -229,10 +266,10 @@ def get_global_multi_tf_analysis(symbol):
     
     if global_score >= 70 and d_score >= 60 and h4_score >= 60:
         master_signal = "🟢 SUPER STRONG LONG"
-        status_desc = "توافق صاعد تام مدعوم بتدفق سيولة المشتقات (OI)."
+        status_desc = "توافق صاعد تام عبر جميع الأطر الزمنية والـ 3-VWAP Suite."
     elif global_score <= 30 and d_score <= 40 and h4_score <= 40:
         master_signal = "🔴 SUPER STRONG SHORT"
-        status_desc = "توافق هابط تام مع تدفق عقود شورت جديدة."
+        status_desc = "توافق هابط تام عبر جميع الأطر الزمنية."
     elif global_score >= 65 and (d_score < 50 or h4_score < 50):
         master_signal = "⚠️ SCALP LONG (Counter-Trend)"
         status_desc = "صعود قصير الأجل على الصغرى عكس اتجاه اليومي."
@@ -241,7 +278,7 @@ def get_global_multi_tf_analysis(symbol):
         status_desc = "هبوط قصير الأجل على الصغرى عكس اتجاه اليومي."
     else:
         master_signal = "🟡 NEUTRAL / CONFLICT"
-        status_desc = "تضارب بين الأطر الزمنية والسيولة - يفضل تقليل المخاطرة."
+        status_desc = "تضارب في الأطر الزمنية والسيولة - يفضل تقليل المخاطرة."
         
     return {
         'global_score': global_score,
@@ -252,11 +289,11 @@ def get_global_multi_tf_analysis(symbol):
     }
 
 # ==========================================
-# 3. القائمة الجانبية (Sidebar)
+# 4. القائمة الجانبية (Sidebar)
 # ==========================================
 
 st.sidebar.title("⚡ AliQuantFund")
-st.sidebar.caption("Institutional Multi-TF & OI Engine")
+st.sidebar.caption("Institutional 3-VWAP Suite")
 st.sidebar.markdown("---")
 
 selected_symbol = st.sidebar.selectbox(
@@ -276,15 +313,14 @@ capital = st.sidebar.number_input("رأس المال الإجمالي ($):", val
 base_risk_pct = st.sidebar.number_input("المخاطرة المستهدفة القصوى (%):", value=2.0, step=0.5)
 
 # ==========================================
-# 4. الواجهة الرئيسية
+# 5. الواجهة الرئيسية
 # ==========================================
 
-st.title(f"📊 التحليل الكمي المدمج + OI: {selected_symbol}")
+st.title(f"📊 التحليل الكمي المركب (3-VWAP Suite): {selected_symbol}")
 
 global_res = get_global_multi_tf_analysis(selected_symbol)
 
-# --- التوصية العامة الموحدة ---
-st.markdown("### 🌐 التوصية العامة الموحدة (Multi-Timeframe & OI Confluence)")
+st.markdown("### 🌐 التوصية العامة الموحدة (Multi-TF & 3-VWAP Confluence)")
 
 g_col1, g_col2 = st.columns([1, 2])
 
@@ -305,7 +341,7 @@ with g_col2:
 
 st.markdown("---")
 
-# --- الشارت والبيانات ---
+# --- الشارت وحاسبة المسافات ---
 df_data = fetch_klines_data(selected_symbol, interval=selected_tf)
 df_oi_data = fetch_open_interest(selected_symbol, interval=selected_tf)
 df_calc = calculate_indicators(df_data)
@@ -316,15 +352,21 @@ if df_calc is not None and not df_calc.empty:
     col_chart, col_signal = st.columns([3, 1])
     
     with col_signal:
-        st.markdown("### 🎯 حاسبة إدارة المخاطر المدمجة")
+        st.markdown("### 🎯 بطاقة المسافات وإدارة المخاطر")
         st.write(f"**الأصل الحالي:** {selected_symbol} ({selected_tf})")
         
-        # عرض معلومات Open Interest اللحظية
-        if df_oi_data is not None and len(df_oi_data) >= 2:
-            current_oi = df_oi_data.iloc[-1]['openInterest']
-            prev_oi = df_oi_data.iloc[-2]['openInterest']
-            oi_change = ((current_oi - prev_oi) / prev_oi) * 100
-            st.metric("الفائدة المفتوحة (OI)", f"{current_oi:,.0f}", f"{oi_change:+.2f}%")
+        # عرض المسافات بوحدة الـ ATR
+        atr_val = latest['atr']
+        d_sess = (latest['close'] - latest['vwap_session']) / atr_val
+        d_week = (latest['close'] - latest['vwap_weekly']) / atr_val
+        d_anc = (latest['close'] - latest['vwap_anchored']) / atr_val
+        
+        st.markdown("#### 📏 المسافة عن الـ VWAPs (بـ ATR):")
+        st.caption(f"• **Session VWAP:** `{d_sess:+.2f} ATR`")
+        st.caption(f"• **Weekly VWAP:** `{d_week:+.2f} ATR`")
+        st.caption(f"• **Anchored VWAP:** `{d_anc:+.2f} ATR`")
+        
+        st.markdown("---")
         
         g_score = global_res['global_score']
         if g_score >= 75 or g_score <= 25:
@@ -346,24 +388,19 @@ if df_calc is not None and not df_calc.empty:
         entry_price = st.number_input("سعر الدخول:", value=float(latest['close']))
 
         sl_source = st.selectbox(
-            "مصدر مستويات الستوب (VWAP):",
-            ["5m VWAP", "15m VWAP", "1h VWAP", "4h VWAP", "1d VWAP", "مخصص"],
-            index=2
+            "مصدر وقف الخسارة (VWAP Layer):",
+            ["Session VWAP", "Weekly VWAP", "Anchored VWAP", "مخصص"],
+            index=0
         )
 
-        vwaps = global_res['tf_vwaps']
-        if sl_source == "5m VWAP":
-            selected_sl_val = vwaps.get('5m', latest['vwap'])
-        elif sl_source == "15m VWAP":
-            selected_sl_val = vwaps.get('15m', latest['vwap'])
-        elif sl_source == "1h VWAP":
-            selected_sl_val = vwaps.get('1h', latest['vwap'])
-        elif sl_source == "4h VWAP":
-            selected_sl_val = vwaps.get('4h', latest['vwap'])
-        elif sl_source == "1d VWAP":
-            selected_sl_val = vwaps.get('1d', latest['vwap'])
+        if sl_source == "Session VWAP":
+            selected_sl_val = float(latest['vwap_session'])
+        elif sl_source == "Weekly VWAP":
+            selected_sl_val = float(latest['vwap_weekly'])
+        elif sl_source == "Anchored VWAP":
+            selected_sl_val = float(latest['vwap_anchored'])
         else:
-            selected_sl_val = float(latest['vwap'])
+            selected_sl_val = float(latest['vwap_session'])
 
         sl_price = st.number_input("وقف الخسارة (SL):", value=float(selected_sl_val))
 
@@ -394,6 +431,7 @@ if df_calc is not None and not df_calc.empty:
     with col_chart:
         fig = go.Figure()
 
+        # 1. الشموع اليابانية
         fig.add_trace(go.Candlestick(
             x=df_calc['timestamp'],
             open=df_calc['open'],
@@ -403,26 +441,40 @@ if df_calc is not None and not df_calc.empty:
             name='Price'
         ))
 
+        # 2. خطوط الـ VWAPs الثلاثة
         fig.add_trace(go.Scatter(
-            x=df_calc['timestamp'], y=df_calc['vwap'],
-            mode='lines', name='Current TF VWAP',
+            x=df_calc['timestamp'], y=df_calc['vwap_session'],
+            mode='lines', name='Session VWAP',
             line=dict(color='gold', width=2)
         ))
 
         fig.add_trace(go.Scatter(
+            x=df_calc['timestamp'], y=df_calc['vwap_weekly'],
+            mode='lines', name='Weekly VWAP',
+            line=dict(color='magenta', width=2, dash='dot')
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=df_calc['timestamp'], y=df_calc['vwap_anchored'],
+            mode='lines', name='Anchored VWAP (Swing Low)',
+            line=dict(color='cyan', width=2, dash='dash')
+        ))
+
+        # 3. خطوط الإيشيموكو
+        fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['tenkan'],
             mode='lines', name='Tenkan-sen',
-            line=dict(color='skyblue', width=1.5)
+            line=dict(color='skyblue', width=1)
         ))
 
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['kijun'],
             mode='lines', name='Kijun-sen',
-            line=dict(color='orange', width=1.5)
+            line=dict(color='orange', width=1)
         ))
 
         fig.update_layout(
-            title=f"شارت {selected_symbol} - {selected_tf}",
+            title=f"شارت {selected_symbol} - {selected_tf} (مع طبقات VWAP الثلاث)",
             template="plotly_dark",
             xaxis_rangeslider_visible=False,
             height=600,
@@ -432,4 +484,4 @@ if df_calc is not None and not df_calc.empty:
         st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("⚡ AliQuantFund Engine v1.9 | Open Interest & Multi-Timeframe Integration")
+st.caption("⚡ AliQuantFund Engine v2.0 | Volatility-Normalized Multi-Layer VWAP Suite")
