@@ -14,6 +14,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# تخصيص المظهر وتسهيل القراءة على الجوال
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap');
@@ -24,9 +25,15 @@ st.markdown("""
     }
     .stMetric {
         background-color: #1e222d;
-        padding: 15px;
+        padding: 12px;
         border-radius: 10px;
         border: 1px solid #2a2e39;
+    }
+    p, span, label {
+        word-break: break-word;
+    }
+    div[data-testid="stSidebarNav"] {
+        display: none;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -43,7 +50,6 @@ TIMEFRAME_WEIGHTS = {
     '5m': 0.08
 }
 
-# تحويل الفريمات لصيغة Bybit الاحتياطية
 BYBIT_TF_MAP = {
     '5m': '5',
     '15m': '15',
@@ -83,7 +89,7 @@ def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
         except:
             continue
 
-    # المحاولة الثانية (Backup): خوادم Bybit العمالة عالمياً دون حظر
+    # المحاولة الثانية (Backup): خوادم Bybit
     try:
         bybit_tf = BYBIT_TF_MAP.get(interval, '5')
         bybit_url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval={bybit_tf}&limit={limit}"
@@ -91,7 +97,6 @@ def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
         if res.status_code == 200:
             result = res.json().get('result', {}).get('list', [])
             if result:
-                # Bybit ترجع البيانات بشكل معكوس (أحدث شمعة أولاً)
                 df = pd.DataFrame(result, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
                 df = df.iloc[::-1].reset_index(drop=True)
                 df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
@@ -282,24 +287,47 @@ if df_calc is not None and not df_calc.empty:
         st.write(f"• **Anchored VWAP:** `${latest['vwap']:.2f}`")
         st.write(f"• **نسبة الزخم الحجمي:** `{latest['vol_ratio']:.2f}x`")
         
+        # --- حاسبة إدارة المخاطر المعدلة والتلقائية ---
         st.markdown("---")
         st.markdown("#### 🔢 الإدارة العددية للصفقة")
+        
         entry_price = st.number_input("سعر الدخول:", value=float(latest['close']))
-        sl_price = st.number_input("وقف الخسارة (SL):", value=float(latest['vwap']))
-        tp_price = st.number_input("أخذ الأرباح (TP):", value=float(entry_price + (abs(entry_price - sl_price) * 2)))
+        
+        # تعيين الستوب الافتراضي بناءً على التقييم الكمي (فوق أو تحت الـ VWAP)
+        default_sl = float(latest['vwap'])
+        sl_price = st.number_input("وقف الخسارة (SL):", value=default_sl)
+        
+        # تحديد اتجاه الصفقة تلقائياً
+        is_long = entry_price >= sl_price
+        sl_distance = abs(entry_price - sl_price)
+        
+        # حساب الـ TP الافتراضي الصحيح حسب الاتجاه (نسبة 1:2)
+        if is_long:
+            default_tp = entry_price + (sl_distance * 2)
+        else:
+            default_tp = entry_price - (sl_distance * 2)
+            
+        tp_price = st.number_input("أخذ الأرباح (TP):", value=float(default_tp))
         
         risk_amount = capital * (risk_pct / 100)
-        sl_distance = abs(entry_price - sl_price)
         
         if sl_distance > 0:
             units = risk_amount / sl_distance
             pos_value = units * entry_price
-            rr_ratio = abs(tp_price - entry_price) / sl_distance
             
+            # حساب العائد الصحيح بناءً على اتجاه الصفقة
+            if is_long:
+                tp_distance = tp_price - entry_price
+            else:
+                tp_distance = entry_price - tp_price
+                
+            rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0
+            
+            st.markdown(f"• **نوع الصفقة:** `{'🟢 شراء (Long)' if is_long else '🔴 بيع (Short)'}`")
             st.caption(f"• **المخاطرة بالدولار:** `${risk_amount:.2f}`")
             st.caption(f"• **حجم الصفقة (Units):** `{units:.4f}`")
-            st.caption(f"• **قيمة العقد:** `${pos_value:.2f}`")
-            st.caption(f"• **نسبة العائد/المخاطرة:** `1:{rr_ratio:.2f}`")
+            st.caption(f"• **قيمة العقد الإجمالية:** `${pos_value:.2f}`")
+            st.caption(f"• **نسبة العائد/المخاطرة (R:R):** `1:{rr_ratio:.2f}`")
 
     with col_chart:
         fig = go.Figure()
@@ -342,5 +370,4 @@ if df_calc is not None and not df_calc.empty:
         st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("⚡ AliQuantFund Engine v1.6 | All Quantitative Rights Reserved")
-
+st.caption("⚡ AliQuantFund Engine v1.7 | All Quantitative Rights Reserved")
