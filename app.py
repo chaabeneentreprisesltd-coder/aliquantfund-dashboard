@@ -14,7 +14,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# تخصيص المظهر وتسهيل القراءة على الجوال
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap');
@@ -39,7 +38,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. محرك جلب البيانات الذكي (محصن ضد الحظر)
+# 2. محرك البيانات الحسابية الموحد
 # ==========================================
 
 TIMEFRAME_WEIGHTS = {
@@ -60,13 +59,12 @@ BYBIT_TF_MAP = {
 
 @st.cache_data(ttl=20)
 def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
-    """دالة ذكية تحاول جلب البيانات من Binance وتتحول لـ Bybit عند وجود حظر 451"""
+    """دالة ذكية لجلب البيانات من Binance وتتحول لـ Bybit عند وجود حظر"""
     formatted_symbol = symbol.replace("/", "").upper()
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
-    # المحاولة الأولى: سيرفرات Binance البديلة
     binance_endpoints = [
         f"https://api1.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
         f"https://api3.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
@@ -89,7 +87,6 @@ def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
         except:
             continue
 
-    # المحاولة الثانية (Backup): خوادم Bybit
     try:
         bybit_tf = BYBIT_TF_MAP.get(interval, '5')
         bybit_url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval={bybit_tf}&limit={limit}"
@@ -103,7 +100,7 @@ def fetch_klines_data(symbol="BTCUSDT", interval="5m", limit=150):
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = df[col].astype(float)
                 return df
-    except Exception as e:
+    except Exception:
         pass
 
     return None
@@ -113,17 +110,14 @@ def calculate_indicators(df):
     if df is None or len(df) < 52:
         return df
 
-    # Anchored VWAP
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
     df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['volume'].cumsum()
     
-    # Ichimoku Cloud System
     df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
     df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
     df['span_a'] = ((df['tenkan'] + df['kijun']) / 2).shift(26)
     df['span_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
     
-    # Volume Ratio
     df['vol_ma'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = np.where(df['vol_ma'] > 0, df['volume'] / df['vol_ma'], 1.0)
     
@@ -165,8 +159,9 @@ def calculate_single_score(df):
     return int(np.clip(score, 0, 100))
 
 def get_global_multi_tf_analysis(symbol):
-    """حساب التوصية العامة الشاملة الموحدة"""
+    """حساب التوصية العامة ومستويات VWAP لجميع الفريمات"""
     tf_scores = {}
+    tf_vwaps = {}
     weighted_sum = 0.0
     
     for tf, weight in TIMEFRAME_WEIGHTS.items():
@@ -175,6 +170,11 @@ def get_global_multi_tf_analysis(symbol):
         score = calculate_single_score(df_calc)
         
         tf_scores[tf] = score
+        if df_calc is not None and not df_calc.empty:
+            tf_vwaps[tf] = df_calc.iloc[-1]['vwap']
+        else:
+            tf_vwaps[tf] = 0.0
+            
         weighted_sum += score * weight
         
     global_score = round(weighted_sum, 1)
@@ -183,25 +183,26 @@ def get_global_multi_tf_analysis(symbol):
     
     if global_score >= 70 and d_score >= 60 and h4_score >= 60:
         master_signal = "🟢 SUPER STRONG LONG"
-        status_desc = "توافق صاعد تام عبر الفريمات الكبرى والصغرى."
+        status_desc = "توافق صاعد تام عبر جميع الأطر الزمنية."
     elif global_score <= 30 and d_score <= 40 and h4_score <= 40:
         master_signal = "🔴 SUPER STRONG SHORT"
-        status_desc = "توافق هابط تام عبر الفريمات الكبرى والصغرى."
+        status_desc = "توافق هابط تام عبر جميع الأطر الزمنية."
     elif global_score >= 65 and (d_score < 50 or h4_score < 50):
         master_signal = "⚠️ SCALP LONG (Counter-Trend)"
-        status_desc = "صعود قصير الأجل على الصغرى عكس اتجاه الفريم اليومي."
+        status_desc = "صعود قصير الأجل على الصغرى عكس اتجاه اليومي."
     elif global_score <= 35 and (d_score > 50 or h4_score > 50):
         master_signal = "⚠️ SCALP SHORT (Counter-Trend)"
-        status_desc = "هبوط قصير الأجل على الصغرى عكس اتجاه الفريم اليومي."
+        status_desc = "هبوط قصير الأجل على الصغرى عكس اتجاه اليومي."
     else:
         master_signal = "🟡 NEUTRAL / CONFLICT"
-        status_desc = "تضارب بين الأطر الزمنية - يفضل عدم الدخول."
+        status_desc = "تضارب بين الأطر الزمنية - يفضل تقليل المخاطرة."
         
     return {
         'global_score': global_score,
         'master_signal': master_signal,
         'status_desc': status_desc,
-        'tf_scores': tf_scores
+        'tf_scores': tf_scores,
+        'tf_vwaps': tf_vwaps
     }
 
 # ==========================================
@@ -209,7 +210,7 @@ def get_global_multi_tf_analysis(symbol):
 # ==========================================
 
 st.sidebar.title("⚡ AliQuantFund")
-st.sidebar.caption("Institutional Quantitative Engine")
+st.sidebar.caption("Institutional Multi-TF Engine")
 st.sidebar.markdown("---")
 
 selected_symbol = st.sidebar.selectbox(
@@ -223,21 +224,22 @@ selected_tf = st.sidebar.selectbox(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("📐 حاسبة إدارة المخاطر")
+st.sidebar.subheader("📐 خيارات رأس المال الأساسية")
 
 capital = st.sidebar.number_input("رأس المال الإجمالي ($):", value=100.0, step=10.0)
-risk_pct = st.sidebar.number_input("نسبة المخاطرة (%):", value=2.0, step=0.5)
+base_risk_pct = st.sidebar.number_input("المخاطرة المستهدفة القصوى (%):", value=2.0, step=0.5)
 
 # ==========================================
 # 4. الواجهة الرئيسية
 # ==========================================
 
-st.title(f"📊 التحليل الكمي المدمج: {selected_symbol}")
+st.title(f"📊 التحليل المدمج: {selected_symbol}")
+
+# جلب البيانات الشاملة
+global_res = get_global_multi_tf_analysis(selected_symbol)
 
 # --- التوصية العامة الموحدة ---
 st.markdown("### 🌐 التوصية العامة الموحدة (Multi-Timeframe Master Confluence)")
-
-global_res = get_global_multi_tf_analysis(selected_symbol)
 
 g_col1, g_col2 = st.columns([1, 2])
 
@@ -250,7 +252,7 @@ with g_col1:
     st.info(f"💡 **الحالة:** {global_res['status_desc']}")
 
 with g_col2:
-    st.write("📊 **درجات التقييم حسب الأطر الزمنية الخمسة:**")
+    st.write("📊 **تقييم الأطر الزمنية الخمسة:**")
     tf_cols = st.columns(5)
     for idx, (tf_key, sc) in enumerate(global_res['tf_scores'].items()):
         color = "🟢" if sc >= 65 else ("🔴" if sc <= 35 else "🟡")
@@ -258,7 +260,7 @@ with g_col2:
 
 st.markdown("---")
 
-# --- الشارت والتحليل الفردي ---
+# --- الشارت وإدارة المخاطر متعددة الأطر ---
 df_data = fetch_klines_data(selected_symbol, interval=selected_tf)
 df_calc = calculate_indicators(df_data)
 
@@ -269,69 +271,81 @@ if df_calc is not None and not df_calc.empty:
     col_chart, col_signal = st.columns([3, 1])
     
     with col_signal:
-        st.markdown("### 🎯 بطاقة الإشارة اللحظية")
-        st.write(f"**الأصل:** {selected_symbol} ({selected_tf})")
+        st.markdown("### 🎯 حاسبة إدارة المخاطر المدمجة (Multi-TF)")
+        st.write(f"**الأصل الحالي:** {selected_symbol} ({selected_tf})")
         
-        st.progress(single_score / 100)
-        st.write(f"**التقييم الكمي للفريم:** `{single_score}/100`")
-        
-        if single_score >= 65:
-            st.success("🟢 التوصية: **Strong Long**")
-        elif single_score <= 35:
-            st.error("🔴 التوصية: **Strong Short**")
+        # --- حساب المخاطرة الديناميكية المعتمدة على جميع الفريمات ---
+        g_score = global_res['global_score']
+        if g_score >= 75 or g_score <= 25:
+            risk_multiplier = 1.0
+            risk_status = "🔥 توافق كامل (مخاطرة 100%)"
+        elif (60 <= g_score < 75) or (25 < g_score <= 40):
+            risk_multiplier = 0.5
+            risk_status = "⚠️ توافق جزئي (مخاطرة 50%)"
         else:
-            st.warning("🟡 التوصية: **No-Trade Regime**")
-            
-        st.markdown("---")
-        st.write(f"• **السعر الحالي:** `${latest['close']:.2f}`")
-        st.write(f"• **Anchored VWAP:** `${latest['vwap']:.2f}`")
-        st.write(f"• **نسبة الزخم الحجمي:** `{latest['vol_ratio']:.2f}x`")
+            risk_multiplier = 0.25
+            risk_status = "🛑 منطقة حيرة (مخاطرة 25%)"
+
+        effective_risk_pct = base_risk_pct * risk_multiplier
+        risk_amount = capital * (effective_risk_pct / 100)
         
-        # --- حاسبة إدارة المخاطر المعدلة والتلقائية ---
+        st.warning(f"**المخاطرة الديناميكية:** `{effective_risk_pct:.2f}%` (${risk_amount:.2f})\n\n*{risk_status}*")
         st.markdown("---")
-        st.markdown("#### 🔢 الإدارة العددية للصفقة")
-        
+
         entry_price = st.number_input("سعر الدخول:", value=float(latest['close']))
-        
-        # تعيين الستوب الافتراضي بناءً على التقييم الكمي (فوق أو تحت الـ VWAP)
-        default_sl = float(latest['vwap'])
-        sl_price = st.number_input("وقف الخسارة (SL):", value=default_sl)
-        
+
+        # اختيار مصدر وقف الخسارة من الفريمات الكبرى/الصغرى
+        sl_source = st.selectbox(
+            "مصدر مستويات الستوب (VWAP):",
+            ["5m VWAP", "15m VWAP", "1h VWAP", "4h VWAP", "1d VWAP", "مخصص"],
+            index=2  # افتراضي 1h VWAP
+        )
+
+        vwaps = global_res['tf_vwaps']
+        if sl_source == "5m VWAP":
+            selected_sl_val = vwaps.get('5m', latest['vwap'])
+        elif sl_source == "15m VWAP":
+            selected_sl_val = vwaps.get('15m', latest['vwap'])
+        elif sl_source == "1h VWAP":
+            selected_sl_val = vwaps.get('1h', latest['vwap'])
+        elif sl_source == "4h VWAP":
+            selected_sl_val = vwaps.get('4h', latest['vwap'])
+        elif sl_source == "1d VWAP":
+            selected_sl_val = vwaps.get('1d', latest['vwap'])
+        else:
+            selected_sl_val = float(latest['vwap'])
+
+        sl_price = st.number_input("وقف الخسارة (SL):", value=float(selected_sl_val))
+
         # تحديد اتجاه الصفقة تلقائياً
         is_long = entry_price >= sl_price
         sl_distance = abs(entry_price - sl_price)
-        
-        # حساب الـ TP الافتراضي الصحيح حسب الاتجاه (نسبة 1:2)
+
+        # حساب الأهداف المتعددة (TP1 و TP2)
         if is_long:
-            default_tp = entry_price + (sl_distance * 2)
+            tp1_default = entry_price + (sl_distance * 1.5)
+            tp2_default = entry_price + (sl_distance * 3.0)
         else:
-            default_tp = entry_price - (sl_distance * 2)
-            
-        tp_price = st.number_input("أخذ الأرباح (TP):", value=float(default_tp))
-        
-        risk_amount = capital * (risk_pct / 100)
-        
+            tp1_default = entry_price - (sl_distance * 1.5)
+            tp2_default = entry_price - (sl_distance * 3.0)
+
+        tp1_price = st.number_input("الهدف الأول (TP1 - 1:1.5):", value=float(tp1_default))
+        tp2_price = st.number_input("الهدف الثاني (TP2 - 1:3.0):", value=float(tp2_default))
+
         if sl_distance > 0:
             units = risk_amount / sl_distance
             pos_value = units * entry_price
-            
-            # حساب العائد الصحيح بناءً على اتجاه الصفقة
-            if is_long:
-                tp_distance = tp_price - entry_price
-            else:
-                tp_distance = entry_price - tp_price
-                
-            rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0
-            
-            st.markdown(f"• **نوع الصفقة:** `{'🟢 شراء (Long)' if is_long else '🔴 بيع (Short)'}`")
-            st.caption(f"• **المخاطرة بالدولار:** `${risk_amount:.2f}`")
-            st.caption(f"• **حجم الصفقة (Units):** `{units:.4f}`")
-            st.caption(f"• **قيمة العقد الإجمالية:** `${pos_value:.2f}`")
-            st.caption(f"• **نسبة العائد/المخاطرة (R:R):** `1:{rr_ratio:.2f}`")
+
+            st.markdown("---")
+            st.markdown(f"• **الاتجاه:** `{'🟢 شراء (Long)' if is_long else '🔴 بيع (Short)'}`")
+            st.caption(f"• **حجم العقود (Units):** `{units:.4f}`")
+            st.caption(f"• **قيمة العقد:** `${pos_value:.2f}`")
+            st.caption(f"• **الهدف 1 (تأمين):** `${tp1_price:.2f}` (1:1.5)")
+            st.caption(f"• **الهدف 2 (مؤسسي):** `${tp2_price:.2f}` (1:3.0)")
 
     with col_chart:
         fig = go.Figure()
-        
+
         fig.add_trace(go.Candlestick(
             x=df_calc['timestamp'],
             open=df_calc['open'],
@@ -340,25 +354,25 @@ if df_calc is not None and not df_calc.empty:
             close=df_calc['close'],
             name='Price'
         ))
-        
+
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['vwap'],
-            mode='lines', name='Anchored VWAP',
+            mode='lines', name='Current TF VWAP',
             line=dict(color='gold', width=2)
         ))
-        
+
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['tenkan'],
             mode='lines', name='Tenkan-sen',
             line=dict(color='skyblue', width=1.5)
         ))
-        
+
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['kijun'],
             mode='lines', name='Kijun-sen',
             line=dict(color='orange', width=1.5)
         ))
-        
+
         fig.update_layout(
             title=f"شارت {selected_symbol} - {selected_tf}",
             template="plotly_dark",
@@ -366,8 +380,8 @@ if df_calc is not None and not df_calc.empty:
             height=600,
             margin=dict(l=10, r=10, t=40, b=10)
         )
-        
+
         st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("⚡ AliQuantFund Engine v1.7 | All Quantitative Rights Reserved")
+st.caption("⚡ AliQuantFund Engine v1.8 | Multi-Timeframe Position Sizing")
