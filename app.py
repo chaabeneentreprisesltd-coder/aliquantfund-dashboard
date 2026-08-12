@@ -3,12 +3,13 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ==========================================
-# 1. إعدادات الصفحة والتصميم العامة
+# 1. إعدادات الصفحة والتصميم العامة (CSS محصن للجوال)
 # ==========================================
 st.set_page_config(
-    page_title="AliQuantFund | Multi-VWAP Engine",
+    page_title="AliQuantFund | Multi-VWAP & CVD Engine",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -28,17 +29,18 @@ st.markdown("""
         border-radius: 10px;
         border: 1px solid #2a2e39;
     }
-    p, span, label {
-        word-break: break-word;
+    p, span, label, div {
+        word-break: break-word !important;
+        white-space: normal !important;
     }
-    div[data-testid="stSidebarNav"] {
-        display: none;
+    div[data-testid="stSidebarNav"], .css-1d33210, .st-emotion-cache-16idsys {
+        display: none !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. محرك البيانات الحركية
+# 2. محرك جلب البيانات الحركية والـ Open Interest
 # ==========================================
 
 TIMEFRAME_WEIGHTS = {
@@ -125,37 +127,43 @@ def fetch_open_interest(symbol="BTCUSDT", interval="5m", limit=30):
     return None
 
 # ==========================================
-# 3. حساب طبقات الـ VWAP الثلاث والـ ATR
+# 3. حساب المؤشرات (3-VWAP, ATR, CVD, Ichimoku)
 # ==========================================
 
 def calculate_indicators(df):
     if df is None or len(df) < 52:
         return df
 
-    # 1. حساب مؤشر ATR (14) للتطبيب بالتذبذب
+    # 1. ATR (14)
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr'] = tr.rolling(14).mean().bfill()
 
-    # السعر النموذجي والسيولة
+    # 2. CVD (Cumulative Volume Delta - Approximated)
+    prev_close = df['close'].shift(1).bfill()
+    delta_direction = np.where(df['close'] >= prev_close, 1, -1)
+    df['delta'] = df['volume'] * delta_direction
+    df['cvd'] = df['delta'].cumsum()
+
+    # 3. VWAP Suite
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
     df['pv'] = df['tp'] * df['volume']
 
-    # 2. Session VWAP (إعادة الضبط يومياً)
+    # Session VWAP
     df['date'] = df['timestamp'].dt.date
     session_pv = df.groupby('date')['pv'].cumsum()
     session_vol = df.groupby('date')['volume'].cumsum()
     df['vwap_session'] = np.where(session_vol > 0, session_pv / session_vol, df['tp'])
 
-    # 3. Weekly VWAP (إعادة الضبط أسبوعياً)
+    # Weekly VWAP
     df['week_year'] = df['timestamp'].dt.strftime('%Y-%U')
     weekly_pv = df.groupby('week_year')['pv'].cumsum()
     weekly_vol = df.groupby('week_year')['volume'].cumsum()
     df['vwap_weekly'] = np.where(weekly_vol > 0, weekly_pv / weekly_vol, df['tp'])
 
-    # 4. Anchored VWAP (مثبت آلياً عند أدنى قاع محلي - Swing Low)
+    # Anchored VWAP (Swing Low)
     min_idx = df['low'].idxmin()
     df_anchored = df.loc[min_idx:].copy()
     anc_pv = (df_anchored['tp'] * df_anchored['volume']).cumsum()
@@ -165,13 +173,13 @@ def calculate_indicators(df):
     df.loc[min_idx:, 'vwap_anchored'] = np.where(anc_vol > 0, anc_pv / anc_vol, df_anchored['tp'])
     df['vwap_anchored'] = df['vwap_anchored'].ffill().bfill()
 
-    # 5. Ichimoku Cloud System
+    # 4. Ichimoku Cloud System
     df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
     df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
     df['span_a'] = ((df['tenkan'] + df['kijun']) / 2).shift(26)
     df['span_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
     
-    # 6. Volume Ratio
+    # 5. Volume Ratio
     df['vol_ma'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = np.where(df['vol_ma'] > 0, df['volume'] / df['vol_ma'], 1.0)
     
@@ -182,19 +190,17 @@ def calculate_single_score(df, df_oi=None):
         return 50
 
     latest = df.iloc[-1]
-    atr = max(latest['atr'], 1e-5) # تفادي القسمة على صفر
+    atr = max(latest['atr'], 1e-5)
     score = 50
     
-    # 1. نظام المسافة عن الـ VWAP الموزون بالـ ATR (Max ±15 pts)
+    # 1. 3-VWAP ATR-Normalized Distance (Max ±15 pts)
     d_session = (latest['close'] - latest['vwap_session']) / atr
     d_weekly = (latest['close'] - latest['vwap_weekly']) / atr
     d_anchored = (latest['close'] - latest['vwap_anchored']) / atr
     
-    delta_session = np.clip(d_session * 2.5, -5.0, 5.0)
-    delta_weekly = np.clip(d_weekly * 2.5, -5.0, 5.0)
-    delta_anchored = np.clip(d_anchored * 2.5, -5.0, 5.0)
-    
-    score += (delta_session + delta_weekly + delta_anchored)
+    score += np.clip(d_session * 2.5, -5.0, 5.0)
+    score += np.clip(d_weekly * 2.5, -5.0, 5.0)
+    score += np.clip(d_anchored * 2.5, -5.0, 5.0)
         
     # 2. Ichimoku Cloud
     if pd.notna(latest['span_a']) and pd.notna(latest['span_b']):
@@ -205,21 +211,21 @@ def calculate_single_score(df, df_oi=None):
         elif latest['close'] < cloud_min:
             score -= 15
             
-    # 3. TK Cross
-    if pd.notna(latest['tenkan']) and pd.notna(latest['kijun']):
-        if latest['tenkan'] > latest['kijun']:
-            score += 10
-        else:
-            score -= 10
-            
-    # 4. Volume Surge
-    if latest['vol_ratio'] > 1.20:
-        if latest['close'] > latest['open']:
-            score += 10
-        elif latest['close'] < latest['open']:
-            score -= 10
-            
-    # 5. Open Interest Logic
+    # 3. CVD Divergence / Trend (Max ±10 pts)
+    if len(df) >= 10:
+        cvd_change = df.iloc[-1]['cvd'] - df.iloc[-10]['cvd']
+        price_change = df.iloc[-1]['close'] - df.iloc[-10]['close']
+        
+        if cvd_change > 0 and price_change > 0:
+            score += 10  # Bullish Buying Pressure
+        elif cvd_change < 0 and price_change < 0:
+            score -= 10  # Bearish Selling Pressure
+        elif cvd_change > 0 and price_change < 0:
+            score += 5   # Bullish Absorption (تجميع)
+        elif cvd_change < 0 and price_change > 0:
+            score -= 5   # Bearish Distribution (تصريف)
+
+    # 4. Open Interest Logic
     if df_oi is not None and len(df_oi) >= 10:
         latest_oi = df_oi.iloc[-1]['openInterest']
         prev_oi = df_oi.iloc[-10]['openInterest']
@@ -266,10 +272,10 @@ def get_global_multi_tf_analysis(symbol):
     
     if global_score >= 70 and d_score >= 60 and h4_score >= 60:
         master_signal = "🟢 SUPER STRONG LONG"
-        status_desc = "توافق صاعد تام عبر جميع الأطر الزمنية والـ 3-VWAP Suite."
+        status_desc = "توافق صاعد تام عبر الفريمات و السيولة (3-VWAP + CVD + OI)."
     elif global_score <= 30 and d_score <= 40 and h4_score <= 40:
         master_signal = "🔴 SUPER STRONG SHORT"
-        status_desc = "توافق هابط تام عبر جميع الأطر الزمنية."
+        status_desc = "توافق هابط تام عبر جميع الأطر والتدفق الحجمي."
     elif global_score >= 65 and (d_score < 50 or h4_score < 50):
         master_signal = "⚠️ SCALP LONG (Counter-Trend)"
         status_desc = "صعود قصير الأجل على الصغرى عكس اتجاه اليومي."
@@ -293,7 +299,6 @@ def get_global_multi_tf_analysis(symbol):
 # ==========================================
 
 st.sidebar.title("⚡ AliQuantFund")
-st.sidebar.caption("Institutional 3-VWAP Suite")
 st.sidebar.markdown("---")
 
 selected_symbol = st.sidebar.selectbox(
@@ -316,11 +321,11 @@ base_risk_pct = st.sidebar.number_input("المخاطرة المستهدفة ا�
 # 5. الواجهة الرئيسية
 # ==========================================
 
-st.title(f"📊 التحليل الكمي المركب (3-VWAP Suite): {selected_symbol}")
+st.title(f"📊 التحليل الكمي المركب: {selected_symbol}")
 
 global_res = get_global_multi_tf_analysis(selected_symbol)
 
-st.markdown("### 🌐 التوصية العامة الموحدة (Multi-TF & 3-VWAP Confluence)")
+st.markdown("### 🌐 التوصية العامة الموحدة (Multi-TF & Order Flow Confluence)")
 
 g_col1, g_col2 = st.columns([1, 2])
 
@@ -341,7 +346,7 @@ with g_col2:
 
 st.markdown("---")
 
-# --- الشارت وحاسبة المسافات ---
+# --- الشارت والتحليل الفردي ---
 df_data = fetch_klines_data(selected_symbol, interval=selected_tf)
 df_oi_data = fetch_open_interest(selected_symbol, interval=selected_tf)
 df_calc = calculate_indicators(df_data)
@@ -355,7 +360,6 @@ if df_calc is not None and not df_calc.empty:
         st.markdown("### 🎯 بطاقة المسافات وإدارة المخاطر")
         st.write(f"**الأصل الحالي:** {selected_symbol} ({selected_tf})")
         
-        # عرض المسافات بوحدة الـ ATR
         atr_val = latest['atr']
         d_sess = (latest['close'] - latest['vwap_session']) / atr_val
         d_week = (latest['close'] - latest['vwap_weekly']) / atr_val
@@ -429,59 +433,54 @@ if df_calc is not None and not df_calc.empty:
             st.caption(f"• **الهدف 2 (مؤسسي):** `${tp2_price:.2f}` (1:3.0)")
 
     with col_chart:
-        fig = go.Figure()
+        # إنشاء شارت مدمج (سعر + مؤشر CVD أسفله)
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.75, 0.25]
+        )
 
-        # 1. الشموع اليابانية
+        # 1. الشموع والـ VWAPs (اللوحة الأولى)
         fig.add_trace(go.Candlestick(
-            x=df_calc['timestamp'],
-            open=df_calc['open'],
-            high=df_calc['high'],
-            low=df_calc['low'],
-            close=df_calc['close'],
+            x=df_calc['timestamp'], open=df_calc['open'],
+            high=df_calc['high'], low=df_calc['low'], close=df_calc['close'],
             name='Price'
-        ))
+        ), row=1, col=1)
 
-        # 2. خطوط الـ VWAPs الثلاثة
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['vwap_session'],
-            mode='lines', name='Session VWAP',
-            line=dict(color='gold', width=2)
-        ))
+            mode='lines', name='Session VWAP', line=dict(color='gold', width=1.5)
+        ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['vwap_weekly'],
-            mode='lines', name='Weekly VWAP',
-            line=dict(color='magenta', width=2, dash='dot')
-        ))
+            mode='lines', name='Weekly VWAP', line=dict(color='magenta', width=1.5, dash='dot')
+        ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
             x=df_calc['timestamp'], y=df_calc['vwap_anchored'],
-            mode='lines', name='Anchored VWAP (Swing Low)',
-            line=dict(color='cyan', width=2, dash='dash')
-        ))
+            mode='lines', name='Anchored VWAP', line=dict(color='cyan', width=1.5, dash='dash')
+        ), row=1, col=1)
 
-        # 3. خطوط الإيشيموكو
+        # 2. مؤشر CVD (اللوحة الثانية)
+        cvd_color = np.where(df_calc['cvd'] >= df_calc['cvd'].shift(1), '#00ff7f', '#ff3b30')
         fig.add_trace(go.Scatter(
-            x=df_calc['timestamp'], y=df_calc['tenkan'],
-            mode='lines', name='Tenkan-sen',
-            line=dict(color='skyblue', width=1)
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=df_calc['timestamp'], y=df_calc['kijun'],
-            mode='lines', name='Kijun-sen',
-            line=dict(color='orange', width=1)
-        ))
+            x=df_calc['timestamp'], y=df_calc['cvd'],
+            mode='lines', name='Cumulative Volume Delta (CVD)',
+            line=dict(color='deepskyblue', width=2),
+            fill='tozeroy'
+        ), row=2, col=1)
 
         fig.update_layout(
-            title=f"شارت {selected_symbol} - {selected_tf} (مع طبقات VWAP الثلاث)",
+            title=f"شارت {selected_symbol} - {selected_tf} (3-VWAP + CVD Order Flow)",
             template="plotly_dark",
             xaxis_rangeslider_visible=False,
-            height=600,
+            height=650,
             margin=dict(l=10, r=10, t=40, b=10)
         )
 
         st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("⚡ AliQuantFund Engine v2.0 | Volatility-Normalized Multi-Layer VWAP Suite")
+st.caption("⚡ AliQuantFund Engine v2.1 | Multi-TF, 3-VWAP, CVD & Open Interest Integration")
