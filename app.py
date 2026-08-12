@@ -2,11 +2,13 @@
 """
 ⚡ AliQuantFund Institutional Architecture v4.4
 ================================================
-CORE QUANT ENGINE
+
+MASTER QUANT ENGINE
 
 DATA
- ├─ Binance Spot / Bybit fallback
- ├─ Binance Futures OI + Funding / Bybit fallback
+ ├─ Binance Spot
+ ├─ Bybit Spot fallback
+ ├─ Binance Futures OI + Funding
  └─ Binance Trade Tape
 
 ANALYSIS
@@ -14,48 +16,41 @@ ANALYSIS
  ├─ Ichimoku
  ├─ Session / Weekly / Monthly VWAP
  ├─ Smart Anchored VWAP
- ├─ Real / Approx CVD
- ├─ OI + Funding
- └─ Multi-Timeframe 1D → 4H → 1H → 15M → 5M
+ ├─ CVD
+ ├─ OI
+ ├─ Funding
+ └─ Multi-Timeframe
 
 DECISION
  ├─ Market State
- ├─ HTF Context
  ├─ Setup Detection
- ├─ Trigger Detection
- ├─ Layered Quant Score
+ ├─ Trigger
+ ├─ Quant Score
  ├─ Signal Grade
  └─ Trade Management
 
-RISK
- ├─ Risk-Based Position Sizing
+BACKTEST
+ ├─ Same core logic as live engine
  ├─ Fees
  ├─ Slippage
- ├─ Partial TP
- ├─ Break-Even
- ├─ Trailing Stop
- └─ Time Stop
-
-BACKTESTING
- ├─ Historical Simulation
- ├─ Realistic Execution
- ├─ Equity Curve
- ├─ Win Rate
+ ├─ Risk based position sizing
+ ├─ SL / TP
+ ├─ Equity curve
+ ├─ Drawdown
  ├─ Profit Factor
- ├─ Sharpe Ratio
- ├─ Max Drawdown
  └─ Detailed Trade Log
 
 IMPORTANT
 -----------
-This system generates analysis and signals.
-It does NOT execute live trades.
+Backtest is intentionally conservative:
+If SL and TP are both touched inside the same candle,
+SL is assumed to execute first.
 """
 
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Tuple, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -66,11 +61,11 @@ from plotly.subplots import make_subplots
 
 
 # ============================================================
-# 0. CONFIGURATION
+# 0. CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="AliQuantFund - Core Quant Engine v4.4",
+    page_title="AliQuantFund v4.4",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -104,29 +99,29 @@ class SetupType(Enum):
 
 
 class TriggerType(Enum):
-    CONFIRMED_BUY = "BUY (Full Alignment)"
-    CONFIRMED_SELL = "SELL (Full Alignment)"
-    WAIT = "WAIT (Awaiting Trigger)"
-    INVALID = "INVALID (Setup Failed)"
+    CONFIRMED_BUY = "BUY"
+    CONFIRMED_SELL = "SELL"
+    WAIT = "WAIT"
+    INVALID = "INVALID"
 
 
 class SignalGrade(Enum):
-    INSTITUTIONAL_STRONG = "A+ (Institutional Strong)"
-    CONFIRMED = "A (Confirmed Setup)"
-    MODERATE = "B (Moderate Alignment)"
-    NEUTRAL = "C (Neutral / High Risk)"
+    INSTITUTIONAL_STRONG = "A+"
+    CONFIRMED = "A"
+    MODERATE = "B"
+    NEUTRAL = "C"
     NO_TRADE = "NO TRADE"
 
 
 class DataStatus(Enum):
-    LIVE = "LIVE (Direct)"
-    FALLBACK = "FALLBACK (Secondary API)"
+    LIVE = "LIVE"
+    FALLBACK = "FALLBACK"
     APPROXIMATED = "APPROXIMATED"
     UNAVAILABLE = "UNAVAILABLE"
 
 
 # ============================================================
-# 2. DATA STRUCTURES
+# 2. DATA CLASSES
 # ============================================================
 
 @dataclass
@@ -160,7 +155,6 @@ class ScoringBreakdown:
     location_score: float = 0.0
 
     total_score: float = 0.0
-
     data_quality_pct: float = 100.0
 
 
@@ -194,30 +188,30 @@ class TradePlan:
     position_size: Optional[float] = None
     risk_amount: Optional[float] = None
 
-    invalidation: str = "No active trade plan"
+    invalidation: str = ""
 
 
 @dataclass
 class BacktestResult:
 
-    total_trades: int = 0
+    initial_capital: float = 0.0
+    final_capital: float = 0.0
 
+    total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
 
     win_rate: float = 0.0
 
-    total_pnl: float = 0.0
     total_pnl_pct: float = 0.0
 
     max_drawdown_pct: float = 0.0
 
     profit_factor: float = 0.0
 
-    sharpe_ratio: float = 0.0
+    average_trade_pct: float = 0.0
 
-    avg_win_pct: float = 0.0
-    avg_loss_pct: float = 0.0
+    expectancy_pct: float = 0.0
 
     trades_log: List[Dict[str, Any]] = field(
         default_factory=list
@@ -229,7 +223,7 @@ class BacktestResult:
 
 
 # ============================================================
-# 3. DATA LOADER
+# 3. MARKET DATA
 # ============================================================
 
 class MarketDataLoader:
@@ -248,7 +242,7 @@ class MarketDataLoader:
         symbol: str,
         interval: str,
         limit: int = 500
-    ) -> Tuple[Optional[pd.DataFrame], str]:
+    ):
 
         symbol = symbol.replace("/", "").upper()
 
@@ -256,7 +250,7 @@ class MarketDataLoader:
             "User-Agent": "Mozilla/5.0"
         }
 
-        endpoints = [
+        urls = [
 
             (
                 "https://data-api.binance.vision/api/v3/klines"
@@ -273,13 +267,6 @@ class MarketDataLoader:
             ),
 
             (
-                "https://api2.binance.com/api/v3/klines"
-                f"?symbol={symbol}"
-                f"&interval={interval}"
-                f"&limit={limit}"
-            ),
-
-            (
                 "https://api3.binance.com/api/v3/klines"
                 f"?symbol={symbol}"
                 f"&interval={interval}"
@@ -287,14 +274,14 @@ class MarketDataLoader:
             )
         ]
 
-        for url in endpoints:
+        for url in urls:
 
             try:
 
                 r = requests.get(
                     url,
                     headers=headers,
-                    timeout=4
+                    timeout=5
                 )
 
                 if r.status_code != 200:
@@ -302,7 +289,7 @@ class MarketDataLoader:
 
                 data = r.json()
 
-                if not isinstance(data, list) or not data:
+                if not data:
                     continue
 
                 df = pd.DataFrame(
@@ -354,8 +341,7 @@ class MarketDataLoader:
                             "close",
                             "volume"
                         ]
-                    ].dropna().reset_index(drop=True),
-
+                    ].dropna(),
                     DataStatus.LIVE.value
                 )
 
@@ -368,18 +354,16 @@ class MarketDataLoader:
 
         try:
 
-            bybit_tf = (
-                MarketDataLoader.BYBIT_TF_MAP.get(
-                    interval,
-                    "5"
-                )
+            tf = MarketDataLoader.BYBIT_TF_MAP.get(
+                interval,
+                "5"
             )
 
             url = (
                 "https://api.bybit.com/v5/market/kline"
                 f"?category=spot"
                 f"&symbol={symbol}"
-                f"&interval={bybit_tf}"
+                f"&interval={tf}"
                 f"&limit={limit}"
             )
 
@@ -447,14 +431,13 @@ class MarketDataLoader:
                                 "volume"
                             ]
                         ].dropna(),
-
                         DataStatus.FALLBACK.value
                     )
 
         except Exception as e:
 
             logger.warning(
-                f"Bybit spot error: {e}"
+                f"Bybit error: {e}"
             )
 
         return (
@@ -462,9 +445,9 @@ class MarketDataLoader:
             DataStatus.UNAVAILABLE.value
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # FUTURES
-    # ========================================================
+    # --------------------------------------------------------
 
     @staticmethod
     @st.cache_data(ttl=15)
@@ -476,14 +459,14 @@ class MarketDataLoader:
 
         symbol = symbol.replace("/", "").upper()
 
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-
         funding = {
             "available": False,
             "current": None,
             "history": []
+        }
+
+        headers = {
+            "User-Agent": "Mozilla/5.0"
         }
 
         try:
@@ -502,16 +485,16 @@ class MarketDataLoader:
 
             url_oi = (
                 "https://fapi.binance.com/futures/data/"
-                f"openInterestHist?"
-                f"symbol={symbol}"
+                "openInterestHist"
+                f"?symbol={symbol}"
                 f"&period={oi_interval}"
                 f"&limit={limit}"
             )
 
             url_fr = (
                 "https://fapi.binance.com/fapi/v1/"
-                f"fundingRate?"
-                f"symbol={symbol}"
+                f"fundingRate"
+                f"?symbol={symbol}"
                 f"&limit=30"
             )
 
@@ -554,28 +537,31 @@ class MarketDataLoader:
                         .reset_index(drop=True)
                     )
 
-                    if r_fr.status_code == 200:
+                    if (
+                        r_fr.status_code == 200
+                    ):
 
                         fr = r_fr.json()
 
                         if isinstance(fr, list) and fr:
 
-                            hist = [
+                            history = [
                                 float(
                                     x.get(
                                         "fundingRate",
                                         0
                                     )
                                 )
-                                for x in reversed(fr)
+                                for x in fr
                             ]
 
-                            funding["available"] = True
+                            history.reverse()
 
-                            if hist:
+                            if history:
 
-                                funding["current"] = hist[0]
-                                funding["history"] = hist
+                                funding["available"] = True
+                                funding["current"] = history[0]
+                                funding["history"] = history
 
                     return (
                         df,
@@ -583,27 +569,23 @@ class MarketDataLoader:
                         funding
                     )
 
-        except Exception as e:
-
-            logger.warning(
-                f"Binance futures error: {e}"
-            )
+        except Exception:
+            pass
 
         # ----------------------------------------------------
-        # BYBIT FALLBACK
+        # BYBIT
         # ----------------------------------------------------
 
         try:
 
-            tf = (
-                MarketDataLoader.BYBIT_TF_MAP.get(
-                    interval,
-                    "5"
-                )
+            tf = MarketDataLoader.BYBIT_TF_MAP.get(
+                interval,
+                "5"
             )
 
             url = (
-                "https://api.bybit.com/v5/market/open-interest"
+                "https://api.bybit.com/v5/market/"
+                "open-interest"
                 f"?category=linear"
                 f"&symbol={symbol}"
                 f"&intervalTime={tf}"
@@ -653,11 +635,8 @@ class MarketDataLoader:
                         funding
                     )
 
-        except Exception as e:
-
-            logger.warning(
-                f"Bybit OI error: {e}"
-            )
+        except Exception:
+            pass
 
         return (
             None,
@@ -665,9 +644,9 @@ class MarketDataLoader:
             funding
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # TRADE TAPE
-    # ========================================================
+    # --------------------------------------------------------
 
     @staticmethod
     @st.cache_data(ttl=10)
@@ -678,7 +657,7 @@ class MarketDataLoader:
 
         symbol = symbol.replace("/", "").upper()
 
-        endpoints = [
+        urls = [
 
             (
                 "https://data-api.binance.vision/api/v3/trades"
@@ -688,21 +667,16 @@ class MarketDataLoader:
             (
                 "https://api1.binance.com/api/v3/trades"
                 f"?symbol={symbol}&limit={limit}"
-            ),
-
-            (
-                "https://api3.binance.com/api/v3/trades"
-                f"?symbol={symbol}&limit={limit}"
             )
         ]
 
-        for url in endpoints:
+        for url in urls:
 
             try:
 
                 r = requests.get(
                     url,
-                    timeout=4
+                    timeout=5
                 )
 
                 if r.status_code != 200:
@@ -740,7 +714,6 @@ class MarketDataLoader:
                             "qty"
                         ]
                     ).reset_index(drop=True),
-
                     DataStatus.LIVE.value
                 )
 
@@ -759,42 +732,45 @@ class MarketDataLoader:
 
 class QuantitativeEngine:
 
-    # ========================================================
-    # ATR
-    # ========================================================
-
     @staticmethod
-    def atr(df, period=14):
+    def atr(
+        df: pd.DataFrame,
+        period: int = 14
+    ):
 
         prev_close = df["close"].shift(1)
 
         tr = pd.concat(
             [
+
                 df["high"] - df["low"],
 
                 (
-                    df["high"] - prev_close
+                    df["high"]
+                    - prev_close
                 ).abs(),
 
                 (
-                    df["low"] - prev_close
+                    df["low"]
+                    - prev_close
                 ).abs()
+
             ],
             axis=1
         ).max(axis=1)
 
         return (
-            tr.rolling(
-                period,
-                min_periods=period
+            tr.ewm(
+                alpha=1 / period,
+                adjust=False
             )
             .mean()
             .bfill()
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # ICHIMOKU
-    # ========================================================
+    # --------------------------------------------------------
 
     @staticmethod
     def ichimoku(df):
@@ -831,12 +807,15 @@ class QuantitativeEngine:
 
         return d
 
-    # ========================================================
+    # --------------------------------------------------------
     # VWAP
-    # ========================================================
+    # --------------------------------------------------------
 
     @staticmethod
-    def vwap(df, mode):
+    def vwap(
+        df,
+        mode
+    ):
 
         typical = (
             df["high"]
@@ -893,39 +872,28 @@ class QuantitativeEngine:
             )
         )
 
-    # ========================================================
-    # SMART ANCHOR
-    # ========================================================
+    # --------------------------------------------------------
+    # ANCHORED VWAP
+    # --------------------------------------------------------
 
     @staticmethod
     def smart_anchor(df):
 
         if len(df) < 30:
+            return 0, "Initial"
 
-            return (
-                max(0, len(df) - 1),
-                "Initial"
-            )
-
-        d = df.tail(100).copy()
-
-        volume_std = (
-            d["volume"].std()
+        d = df.tail(
+            min(150, len(df))
         )
 
-        if volume_std == 0 or pd.isna(volume_std):
+        mean = d["volume"].mean()
 
-            return (
-                d.index[0],
-                "No Volume Spike"
-            )
+        std = d["volume"].std()
 
         z = (
-            d["volume"]
-            -
-            d["volume"].mean()
+            d["volume"] - mean
         ) / (
-            volume_std
+            std + 1e-9
         )
 
         idx = z.idxmax()
@@ -935,19 +903,11 @@ class QuantitativeEngine:
             f"Volume Spike Z={z.loc[idx]:.2f}"
         )
 
-    # ========================================================
-    # ANCHORED VWAP
-    # ========================================================
-
     @staticmethod
-    def anchored_vwap(df, anchor):
-
-        if anchor < 0 or anchor >= len(df):
-
-            return pd.Series(
-                np.nan,
-                index=df.index
-            )
+    def anchored_vwap(
+        df,
+        anchor
+    ):
 
         typical = (
             df["high"]
@@ -959,183 +919,161 @@ class QuantitativeEngine:
 
         pv = typical * df["volume"]
 
+        volume = df["volume"].copy()
+
         pv = pv.copy()
-        vol = df["volume"].copy()
 
-        pv.iloc[:anchor] = 0
-        vol.iloc[:anchor] = 0
+        if anchor > 0:
 
-        cumulative_pv = pv.cumsum()
-        cumulative_vol = vol.cumsum()
+            pv.iloc[:anchor] = 0
+            volume.iloc[:anchor] = 0
 
-        avwap = (
-            cumulative_pv
+        result = (
+            pv.cumsum()
             /
-            cumulative_vol.replace(
+            volume.cumsum().replace(
                 0,
                 np.nan
             )
         )
 
-        avwap.iloc[:anchor] = np.nan
+        if anchor > 0:
+            result.iloc[:anchor] = np.nan
 
-        return avwap
+        return result
 
-    # ========================================================
+    # --------------------------------------------------------
     # CVD
-    # ========================================================
+    # --------------------------------------------------------
 
     @staticmethod
     def cvd(
         df,
-        trades,
-        timeframe
+        trades=None,
+        timeframe="5m"
     ):
 
-        # ----------------------------------------------------
-        # REAL TRADE CVD
-        # ----------------------------------------------------
+        if (
+            trades is None
+            or trades.empty
+        ):
 
-        if trades is not None and not trades.empty:
-
-            t = trades.copy()
-
-            t["signed"] = np.where(
-                t["is_buy"],
-                t["qty"],
-                -t["qty"]
-            )
-
-            rule = {
-                "5m": "5min",
-                "15m": "15min",
-                "1h": "1h",
-                "4h": "4h",
-                "1d": "1D"
-            }.get(
-                timeframe,
-                "5min"
+            candle_range = (
+                df["high"]
+                -
+                df["low"]
+            ).replace(
+                0,
+                1e-9
             )
 
             delta = (
-                t.set_index("time")["signed"]
-                .resample(rule)
-                .sum()
+                df["volume"]
+                *
+                (
+                    (
+                        df["close"]
+                        -
+                        df["open"]
+                    )
+                    /
+                    candle_range
+                )
             )
 
             cvd = delta.cumsum()
 
-            candle_index = pd.DatetimeIndex(
-                df["timestamp"]
-            )
-
-            cvd = (
-                cvd.reindex(
-                    candle_index,
-                    method="ffill"
-                )
-                .fillna(0)
-            )
-
-            cvd = cvd.reset_index(drop=True)
-
             return (
                 cvd,
-                DataStatus.LIVE.value,
-                QuantitativeEngine.cvd_stats(
-                    df,
-                    cvd
-                )
+                DataStatus.APPROXIMATED.value
             )
 
-        # ----------------------------------------------------
-        # APPROX CVD
-        # ----------------------------------------------------
+        t = trades.copy()
 
-        candle_range = (
-            df["high"]
-            -
-            df["low"]
-        ).replace(
-            0,
-            1e-9
+        t["signed"] = np.where(
+            t["is_buy"],
+            t["qty"],
+            -t["qty"]
+        )
+
+        rules = {
+            "5m": "5min",
+            "15m": "15min",
+            "1h": "1h",
+            "4h": "4h",
+            "1d": "1D"
+        }
+
+        rule = rules.get(
+            timeframe,
+            "5min"
         )
 
         delta = (
-            df["volume"]
-            *
-            (
-                (
-                    df["close"]
-                    -
-                    df["open"]
-                )
-                /
-                candle_range
-            )
+            t.set_index("time")[
+                "signed"
+            ]
+            .resample(rule)
+            .sum()
         )
 
         cvd = delta.cumsum()
 
-        return (
-            cvd,
-            DataStatus.APPROXIMATED.value,
-            QuantitativeEngine.cvd_stats(
-                df,
-                cvd
-            )
+        target_index = pd.DatetimeIndex(
+            df["timestamp"]
         )
 
-    # ========================================================
+        cvd = (
+            cvd.reindex(
+                target_index,
+                method="ffill"
+            )
+            .fillna(0)
+        )
+
+        return (
+            cvd.reset_index(drop=True),
+            DataStatus.LIVE.value
+        )
+
+    # --------------------------------------------------------
     # CVD STATS
-    # ========================================================
+    # --------------------------------------------------------
 
     @staticmethod
-    def cvd_stats(df, cvd):
+    def cvd_stats(
+        df,
+        cvd
+    ):
 
-        if len(df) < 20:
-
+        if len(df) < 10:
             return {
                 "slope": 0.0,
-                "normalized_slope": 0.0,
                 "divergence": "NONE"
             }
-
-        lookback = min(
-            10,
-            len(df) - 1
-        )
 
         price_change = (
             df["close"].iloc[-1]
             -
-            df["close"].iloc[-lookback]
+            df["close"].iloc[-10]
         )
 
         cvd_change = (
             cvd.iloc[-1]
             -
-            cvd.iloc[-lookback]
+            cvd.iloc[-10]
         )
 
-        volume_base = (
-            df["volume"]
-            .tail(20)
-            .mean()
+        recent = max(
+            abs(cvd.iloc[-5]),
+            1e-9
         )
 
-        if volume_base <= 0:
-            volume_base = 1
-
-        normalized_slope = (
-            cvd_change
-            /
-            (
-                volume_base
-                *
-                lookback
-            )
-        )
+        slope = (
+            cvd.iloc[-1]
+            -
+            cvd.iloc[-5]
+        ) / recent
 
         divergence = "NONE"
 
@@ -1155,25 +1093,27 @@ class QuantitativeEngine:
 
         return {
             "slope": float(
-                normalized_slope
+                np.clip(
+                    slope,
+                    -5,
+                    5
+                )
             ),
-
-            "normalized_slope": float(
-                normalized_slope
-            ),
-
             "divergence": divergence
         }
 
 
 # ============================================================
-# 5. MARKET STATE ENGINE
+# 5. MARKET STATE
 # ============================================================
 
 class MarketStateEngine:
 
     @staticmethod
-    def classify(df, atr):
+    def classify(
+        df,
+        atr
+    ):
 
         close = df["close"].iloc[-1]
 
@@ -1198,12 +1138,16 @@ class MarketStateEngine:
         )
 
         recent_range = (
-            df["high"].tail(10).max()
+            df["high"]
+            .tail(10)
+            .max()
             -
-            df["low"].tail(10).min()
+            df["low"]
+            .tail(10)
+            .min()
         )
 
-        if recent_range > 3.5 * atr:
+        if recent_range > 4.0 * atr:
 
             return (
                 MarketState.VOLATILE_EXPANSION
@@ -1227,31 +1171,29 @@ class MarketStateEngine:
                 MarketState.TRENDING_BEAR
             )
 
-        return (
-            MarketState.RANGE_COMPRESSION
-        )
+        return MarketState.RANGE_COMPRESSION
 
 
 # ============================================================
-# 6. MULTI-TIMEFRAME ENGINE
+# 6. MULTI TIMEFRAME
 # ============================================================
 
 class MultiTimeframeEngine:
 
     @staticmethod
-    def evaluate(symbol):
+    def evaluate(
+        symbol
+    ):
 
-        tfs = [
+        result = {}
+
+        for tf in [
             "1d",
             "4h",
             "1h",
             "15m",
             "5m"
-        ]
-
-        result = {}
-
-        for tf in tfs:
+        ]:
 
             df, status = (
                 MarketDataLoader.fetch_klines(
@@ -1263,7 +1205,7 @@ class MultiTimeframeEngine:
 
             if (
                 df is None
-                or len(df) < 60
+                or len(df) < 80
             ):
 
                 result[tf] = {
@@ -1282,15 +1224,23 @@ class MultiTimeframeEngine:
             close = d["close"].iloc[-1]
 
             tenkan = d["tenkan"].iloc[-1]
+
             kijun = d["kijun"].iloc[-1]
 
             span_a = d["span_a"].iloc[-1]
+
             span_b = d["span_b"].iloc[-1]
 
-            if pd.isna(span_a):
+            if pd.isna(
+                span_a
+            ):
+
                 span_a = close
 
-            if pd.isna(span_b):
+            if pd.isna(
+                span_b
+            ):
+
                 span_b = close
 
             cloud_high = max(
@@ -1309,7 +1259,7 @@ class MultiTimeframeEngine:
             ):
 
                 bias = "BULLISH"
-                score = 80
+                score = 85
 
             elif (
                 close < cloud_low
@@ -1317,24 +1267,22 @@ class MultiTimeframeEngine:
             ):
 
                 bias = "BEARISH"
-                score = 20
+                score = 15
+
+            elif close > kijun:
+
+                bias = "BULLISH"
+                score = 60
+
+            elif close < kijun:
+
+                bias = "BEARISH"
+                score = 40
 
             else:
 
-                if close > kijun:
-
-                    bias = "BULLISH"
-                    score = 60
-
-                elif close < kijun:
-
-                    bias = "BEARISH"
-                    score = 40
-
-                else:
-
-                    bias = "NEUTRAL"
-                    score = 50
+                bias = "NEUTRAL"
+                score = 50
 
             result[tf] = {
                 "score": score,
@@ -1342,17 +1290,17 @@ class MultiTimeframeEngine:
                 "status": status
             }
 
-        context = (
-            result["1d"]["score"] * 0.60
+        context_score = (
+            result["1d"]["score"] * 0.55
             +
-            result["4h"]["score"] * 0.40
+            result["4h"]["score"] * 0.45
         )
 
-        if context >= 65:
+        if context_score >= 65:
 
             context_bias = "BULLISH"
 
-        elif context <= 35:
+        elif context_score <= 35:
 
             context_bias = "BEARISH"
 
@@ -1360,7 +1308,7 @@ class MultiTimeframeEngine:
 
             context_bias = "NEUTRAL"
 
-        execution = (
+        execution_score = (
             result["15m"]["score"] * 0.50
             +
             result["5m"]["score"] * 0.50
@@ -1368,16 +1316,10 @@ class MultiTimeframeEngine:
 
         return {
             "frames": result,
-
-            "context_score": context,
-
+            "context_score": context_score,
             "context_bias": context_bias,
-
-            "direction_bias":
-                result["1h"]["bias"],
-
-            "execution_score":
-                execution
+            "direction_bias": result["1h"]["bias"],
+            "execution_score": execution_score
         }
 
 
@@ -1396,6 +1338,7 @@ class SetupEngine:
     ):
 
         close = df["close"].iloc[-1]
+
         prev_close = df["close"].iloc[-2]
 
         vwap = metrics.vwap_session
@@ -1406,26 +1349,24 @@ class SetupEngine:
         )
 
         # ----------------------------------------------------
-        # VWAP RECLAIM
+        # RECLAIM
         # ----------------------------------------------------
 
         bullish_reclaim = (
             prev_close < vwap
-            and
-            close > vwap
+            and close > vwap
         )
 
         bearish_reclaim = (
             prev_close > vwap
-            and
-            close < vwap
+            and close < vwap
         )
 
         if bullish_reclaim:
 
             return SetupResult(
                 SetupType.RECLAIM,
-                "Price reclaimed Session VWAP",
+                "Bullish VWAP reclaim",
                 "LONG",
                 80
             )
@@ -1434,7 +1375,7 @@ class SetupEngine:
 
             return SetupResult(
                 SetupType.RECLAIM,
-                "Price lost Session VWAP",
+                "Bearish VWAP loss",
                 "SHORT",
                 80
             )
@@ -1443,62 +1384,62 @@ class SetupEngine:
         # BREAKOUT
         # ----------------------------------------------------
 
-        if len(df) >= 25:
+        resistance = (
+            df["high"]
+            .iloc[-21:-1]
+            .max()
+        )
 
-            resistance = (
-                df["high"]
-                .iloc[-21:-1]
-                .max()
+        support = (
+            df["low"]
+            .iloc[-21:-1]
+            .min()
+        )
+
+        volume_avg = (
+            df["volume"]
+            .iloc[-21:-1]
+            .mean()
+        )
+
+        volume_ratio = (
+            df["volume"].iloc[-1]
+            /
+            max(volume_avg, 1e-9)
+        )
+
+        if (
+            close > resistance
+            and volume_ratio >= 1.5
+        ):
+
+            return SetupResult(
+                SetupType.BREAKOUT,
+                "Resistance breakout with volume expansion",
+                "LONG",
+                85
             )
 
-            support = (
-                df["low"]
-                .iloc[-21:-1]
-                .min()
+        if (
+            close < support
+            and volume_ratio >= 1.5
+        ):
+
+            return SetupResult(
+                SetupType.BREAKOUT,
+                "Support breakdown with volume expansion",
+                "SHORT",
+                85
             )
-
-            volume_avg = (
-                df["volume"]
-                .iloc[-21:-1]
-                .mean()
-            )
-
-            volume_expansion = (
-                df["volume"].iloc[-1]
-                >
-                volume_avg * 1.5
-            )
-
-            if (
-                close > resistance
-                and volume_expansion
-            ):
-
-                return SetupResult(
-                    SetupType.BREAKOUT,
-                    "Resistance breakout with volume expansion",
-                    "LONG",
-                    85
-                )
-
-            if (
-                close < support
-                and volume_expansion
-            ):
-
-                return SetupResult(
-                    SetupType.BREAKOUT,
-                    "Support breakdown with volume expansion",
-                    "SHORT",
-                    85
-                )
 
         # ----------------------------------------------------
         # REJECTION
         # ----------------------------------------------------
 
         high = df["high"].iloc[-1]
+
         low = df["low"].iloc[-1]
+
         open_ = df["open"].iloc[-1]
 
         upper_wick = (
@@ -1521,26 +1462,24 @@ class SetupEngine:
 
         if (
             upper_wick > atr * 0.7
-            and
-            close < vwap
+            and close < vwap
         ):
 
             return SetupResult(
                 SetupType.REJECTION,
-                "Upper rejection below VWAP",
+                "Upper wick rejection below VWAP",
                 "SHORT",
                 70
             )
 
         if (
             lower_wick > atr * 0.7
-            and
-            close > vwap
+            and close > vwap
         ):
 
             return SetupResult(
                 SetupType.REJECTION,
-                "Lower rejection above VWAP",
+                "Lower wick rejection above VWAP",
                 "LONG",
                 70
             )
@@ -1573,14 +1512,14 @@ class SetupEngine:
 
         return SetupResult(
             SetupType.NO_SETUP,
-            "No high-quality structural setup",
+            "No structural setup",
             "NONE",
             0
         )
 
 
 # ============================================================
-# 8. TRIGGER ENGINE
+# 8. TRIGGER
 # ============================================================
 
 class TriggerEngine:
@@ -1616,16 +1555,14 @@ class TriggerEngine:
             metrics.cvd_slope > 0
             or
             metrics.cvd_divergence
-            ==
-            "BULLISH_ABSORPTION"
+            == "BULLISH_ABSORPTION"
         )
 
         bearish_flow = (
             metrics.cvd_slope < 0
             or
             metrics.cvd_divergence
-            ==
-            "BEARISH_ABSORPTION"
+            == "BEARISH_ABSORPTION"
         )
 
         if setup.direction == "LONG":
@@ -1658,8 +1595,7 @@ class TriggerEngine:
 
             if (
                 metrics.cvd_divergence
-                ==
-                "BEARISH_ABSORPTION"
+                == "BEARISH_ABSORPTION"
             ):
 
                 return TriggerType.INVALID
@@ -1696,8 +1632,7 @@ class TriggerEngine:
 
             if (
                 metrics.cvd_divergence
-                ==
-                "BULLISH_ABSORPTION"
+                == "BULLISH_ABSORPTION"
             ):
 
                 return TriggerType.INVALID
@@ -1708,7 +1643,7 @@ class TriggerEngine:
 
 
 # ============================================================
-# 9. FACTOR SCORING ENGINE
+# 9. SCORING
 # ============================================================
 
 class FactorScoringEngine:
@@ -1770,16 +1705,14 @@ class FactorScoringEngine:
 
         if (
             metrics.cvd_divergence
-            ==
-            "BULLISH_ABSORPTION"
+            == "BULLISH_ABSORPTION"
         ):
 
             flow = 20
 
         elif (
             metrics.cvd_divergence
-            ==
-            "BEARISH_ABSORPTION"
+            == "BEARISH_ABSORPTION"
         ):
 
             flow = -20
@@ -1788,7 +1721,7 @@ class FactorScoringEngine:
 
             flow = float(
                 np.clip(
-                    metrics.cvd_slope * 100,
+                    metrics.cvd_slope * 50,
                     -20,
                     20
                 )
@@ -1802,47 +1735,32 @@ class FactorScoringEngine:
 
         if (
             futures_status
-            !=
-            DataStatus.UNAVAILABLE.value
+            != DataStatus.UNAVAILABLE.value
         ):
 
-            # OI expansion
             if metrics.oi_change_pct > 2:
 
                 if direction > 0:
-
                     positioning += 15
 
                 elif direction < 0:
-
                     positioning -= 15
 
-            # OI contraction
             elif metrics.oi_change_pct < -2:
 
                 if direction > 0:
-
                     positioning -= 8
 
                 elif direction < 0:
+                    positioning += 8
+
+            if metrics.funding_rate is not None:
+
+                if metrics.funding_rate < -0.0001:
 
                     positioning += 8
 
-            # Funding
-            if (
-                metrics.funding_rate
-                is not None
-            ):
-
-                funding = (
-                    metrics.funding_rate
-                )
-
-                if funding < -0.0001:
-
-                    positioning += 8
-
-                elif funding > 0.0003:
+                elif metrics.funding_rate > 0.0003:
 
                     positioning -= 8
 
@@ -1881,42 +1799,40 @@ class FactorScoringEngine:
             )
 
         # ----------------------------------------------------
-        # MARKET REGIME WEIGHTS
+        # WEIGHTS
         # ----------------------------------------------------
 
         if (
             market_state
-            ==
-            MarketState.RANGE_COMPRESSION
+            == MarketState.RANGE_COMPRESSION
         ):
 
-            dw, fw, pw, lw = (
-                0.15,
-                0.30,
-                0.15,
-                0.40
-            )
+            dw = 0.15
+            fw = 0.30
+            pw = 0.15
+            lw = 0.40
 
         elif market_state in [
 
             MarketState.TRENDING_BULL,
-
             MarketState.TRENDING_BEAR
 
         ]:
 
-            dw, fw, pw, lw = (
-                0.35,
-                0.25,
-                0.20,
-                0.20
-            )
+            dw = 0.35
+            fw = 0.25
+            pw = 0.20
+            lw = 0.20
 
         else:
 
-            dw = fw = pw = lw = 0.25
+            dw = 0.25
+            fw = 0.25
+            pw = 0.25
+            lw = 0.25
 
         total = (
+
             direction * dw
             +
             flow * fw
@@ -1924,6 +1840,7 @@ class FactorScoringEngine:
             positioning * pw
             +
             location * lw
+
         )
 
         # ----------------------------------------------------
@@ -1934,32 +1851,28 @@ class FactorScoringEngine:
 
         if (
             futures_status
-            ==
-            DataStatus.UNAVAILABLE.value
+            == DataStatus.UNAVAILABLE.value
         ):
 
             quality -= 25
 
         elif (
             futures_status
-            ==
-            DataStatus.FALLBACK.value
+            == DataStatus.FALLBACK.value
         ):
 
             quality -= 10
 
         if (
             cvd_status
-            ==
-            DataStatus.APPROXIMATED.value
+            == DataStatus.APPROXIMATED.value
         ):
 
             quality -= 15
 
         elif (
             cvd_status
-            ==
-            DataStatus.UNAVAILABLE.value
+            == DataStatus.UNAVAILABLE.value
         ):
 
             quality -= 25
@@ -1968,27 +1881,27 @@ class FactorScoringEngine:
 
             direction_score=round(
                 direction,
-                1
+                2
             ),
 
             flow_score=round(
                 flow,
-                1
+                2
             ),
 
             positioning_score=round(
                 positioning,
-                1
+                2
             ),
 
             location_score=round(
                 location,
-                1
+                2
             ),
 
             total_score=round(
                 total,
-                1
+                2
             ),
 
             data_quality_pct=max(
@@ -1999,7 +1912,7 @@ class FactorScoringEngine:
 
 
 # ============================================================
-# 10. SIGNAL ENGINE
+# 10. SIGNAL
 # ============================================================
 
 class SignalEngine:
@@ -2015,16 +1928,14 @@ class SignalEngine:
 
         if (
             trigger
-            ==
-            TriggerType.INVALID
+            == TriggerType.INVALID
         ):
 
             return SignalGrade.NO_TRADE
 
         if (
             setup.setup
-            ==
-            SetupType.NO_SETUP
+            == SetupType.NO_SETUP
         ):
 
             return SignalGrade.NEUTRAL
@@ -2033,16 +1944,16 @@ class SignalEngine:
 
             return SignalGrade.NO_TRADE
 
-        abs_score = abs(score)
+        absolute = abs(score)
 
         if (
-            abs_score >= 30
-            and
-            quality >= 85
-            and
-            trigger in [
+            absolute >= 30
+            and quality >= 85
+            and trigger in [
+
                 TriggerType.CONFIRMED_BUY,
                 TriggerType.CONFIRMED_SELL
+
             ]
         ):
 
@@ -2051,17 +1962,18 @@ class SignalEngine:
             )
 
         if (
-            abs_score >= 22
-            and
-            trigger in [
+            absolute >= 22
+            and trigger in [
+
                 TriggerType.CONFIRMED_BUY,
                 TriggerType.CONFIRMED_SELL
+
             ]
         ):
 
             return SignalGrade.CONFIRMED
 
-        if abs_score >= 15:
+        if absolute >= 15:
 
             return SignalGrade.MODERATE
 
@@ -2076,8 +1988,8 @@ class TradeManagement:
 
     @staticmethod
     def build(
-        df,
-        metrics,
+        price,
+        atr,
         direction,
         capital,
         risk_pct
@@ -2090,10 +2002,8 @@ class TradeManagement:
 
             return TradePlan()
 
-        price = df["close"].iloc[-1]
-
         atr = max(
-            metrics.atr_14,
+            atr,
             price * 0.001
         )
 
@@ -2108,13 +2018,13 @@ class TradeManagement:
         entry_low = (
             price
             -
-            atr * 0.15
+            atr * 0.10
         )
 
         entry_high = (
             price
             +
-            atr * 0.15
+            atr * 0.10
         )
 
         entry = (
@@ -2131,12 +2041,6 @@ class TradeManagement:
                 atr * 1.5
             )
 
-            risk_per_unit = (
-                entry
-                -
-                stop
-            )
-
             tp1 = (
                 entry
                 +
@@ -2153,11 +2057,6 @@ class TradeManagement:
                 entry
                 +
                 atr * 4.0
-            )
-
-            invalidation = (
-                f"LONG invalid if price closes "
-                f"below ${stop:,.4f}"
             )
 
         else:
@@ -2168,12 +2067,6 @@ class TradeManagement:
                 atr * 1.5
             )
 
-            risk_per_unit = (
-                stop
-                -
-                entry
-            )
-
             tp1 = (
                 entry
                 -
@@ -2192,10 +2085,9 @@ class TradeManagement:
                 atr * 4.0
             )
 
-            invalidation = (
-                f"SHORT invalid if price closes "
-                f"above ${stop:,.4f}"
-            )
+        risk_per_unit = abs(
+            entry - stop
+        )
 
         position_size = (
             risk_amount
@@ -2208,42 +2100,43 @@ class TradeManagement:
 
         def rr(target):
 
-            if direction == "LONG":
-
-                return (
-                    target
-                    -
-                    entry
-                ) / risk_per_unit
-
-            return (
-                entry
-                -
-                target
-            ) / risk_per_unit
+            return abs(
+                target - entry
+            ) / max(
+                risk_per_unit,
+                1e-9
+            )
 
         return TradePlan(
 
             direction=direction,
 
             entry_low=entry_low,
+
             entry_high=entry_high,
 
             stop_loss=stop,
 
             tp1=tp1,
+
             tp2=tp2,
+
             tp3=tp3,
 
             rr_tp1=rr(tp1),
+
             rr_tp2=rr(tp2),
+
             rr_tp3=rr(tp3),
 
             position_size=position_size,
 
             risk_amount=risk_amount,
 
-            invalidation=invalidation
+            invalidation=(
+                f"{direction} invalidation "
+                f"at {stop:.6f}"
+            )
         )
 
 
@@ -2255,30 +2148,40 @@ class BacktestEngine:
 
     @staticmethod
     def run_backtest(
+
         df,
+
         initial_capital=100.0,
+
         risk_pct=2.0,
+
         fee_pct=0.10,
-        slippage_pct=0.05,
-        tp1_fraction=0.40,
-        tp2_fraction=0.30,
-        tp3_fraction=0.30,
-        breakeven_after_tp1=True,
-        trailing_atr=1.0,
-        max_bars_in_trade=48
+
+        slippage_pct=0.03,
+
+        min_score=15,
+
+        use_trend_filter=True
+
     ) -> BacktestResult:
 
         if (
             df is None
-            or len(df) < 80
+            or len(df) < 100
         ):
 
-            return BacktestResult()
+            return BacktestResult(
+                initial_capital=initial_capital,
+                final_capital=initial_capital
+            )
 
-        d = (
-            df.copy()
-            .reset_index(drop=True)
+        d = df.copy().reset_index(
+            drop=True
         )
+
+        # ----------------------------------------------------
+        # PRE-CALCULATE INDICATORS
+        # ----------------------------------------------------
 
         d = (
             QuantitativeEngine
@@ -2286,21 +2189,43 @@ class BacktestEngine:
         )
 
         d["atr"] = (
-            QuantitativeEngine.atr(d)
+            QuantitativeEngine
+            .atr(d)
         )
 
-        d["vwap"] = (
-            QuantitativeEngine.vwap(
+        d["vwap_session"] = (
+            QuantitativeEngine
+            .vwap(
                 d,
                 "SESSION"
             )
         )
 
+        d["vwap_weekly"] = (
+            QuantitativeEngine
+            .vwap(
+                d,
+                "WEEKLY"
+            )
+        )
+
+        d["vwap_monthly"] = (
+            QuantitativeEngine
+            .vwap(
+                d,
+                "MONTHLY"
+            )
+        )
+
+        # ----------------------------------------------------
+        # STATE
+        # ----------------------------------------------------
+
         capital = float(
             initial_capital
         )
 
-        peak_capital = capital
+        peak = capital
 
         max_drawdown = 0.0
 
@@ -2310,13 +2235,30 @@ class BacktestEngine:
 
         in_position = False
 
-        position = None
+        direction = None
 
-        # ====================================================
-        # LOOP
-        # ====================================================
+        entry_price = 0.0
 
-        for i in range(60, len(d)):
+        stop_loss = 0.0
+
+        tp1 = 0.0
+
+        position_size = 0.0
+
+        entry_time = None
+
+        entry_index = None
+
+        # ----------------------------------------------------
+        # MAIN LOOP
+        # ----------------------------------------------------
+
+        start_index = 80
+
+        for i in range(
+            start_index,
+            len(d)
+        ):
 
             row = d.iloc[i]
 
@@ -2337,663 +2279,150 @@ class BacktestEngine:
             )
 
             vwap = float(
-                row["vwap"]
+                row["vwap_session"]
             )
 
-            # ------------------------------------------------
-            # Equity Snapshot
-            # ------------------------------------------------
+            if not np.isfinite(
+                atr
+            ) or atr <= 0:
 
-            equity_curve.append({
-                "time": row["timestamp"],
-                "equity": capital
-            })
+                continue
+
+            if not np.isfinite(
+                vwap
+            ):
+
+                continue
 
             # =================================================
-            # MANAGE ACTIVE TRADE
+            # MANAGE ACTIVE POSITION
             # =================================================
 
             if in_position:
 
-                position["bars"] += 1
+                exit_price = None
 
-                direction = (
-                    position["direction"]
-                )
+                exit_reason = None
 
-                entry = (
-                    position["entry"]
-                )
-
-                stop = (
-                    position["stop"]
-                )
-
-                tp1 = (
-                    position["tp1"]
-                )
-
-                tp2 = (
-                    position["tp2"]
-                )
-
-                tp3 = (
-                    position["tp3"]
-                )
-
-                remaining_qty = (
-                    position["remaining_qty"]
-                )
-
-                realized_pnl = 0.0
-
-                events = []
-
-                # --------------------------------------------
+                # ---------------------------------------------
                 # LONG
-                # --------------------------------------------
+                # ---------------------------------------------
 
                 if direction == "LONG":
 
-                    # Stop has priority if both
-                    # stop and target are touched
-                    if low <= stop:
+                    hit_sl = (
+                        low <= stop_loss
+                    )
 
-                        exit_price = (
-                            stop
-                            *
-                            (
-                                1
-                                -
-                                slippage_pct
-                                /
-                                100
-                            )
-                        )
+                    hit_tp = (
+                        high >= tp1
+                    )
 
-                        pnl = (
-                            exit_price
-                            -
-                            entry
-                        ) * remaining_qty
+                    # Conservative assumption:
+                    # if both occur in same candle -> SL first
 
-                        fee = (
-                            (
-                                exit_price
-                                *
-                                remaining_qty
-                            )
-                            *
-                            fee_pct
-                            /
-                            100
-                        )
+                    if hit_sl:
 
-                        pnl -= fee
+                        exit_price = stop_loss
 
-                        realized_pnl += pnl
+                        exit_reason = "SL"
 
-                        events.append(
-                            "SL"
-                        )
+                    elif hit_tp:
 
-                        remaining_qty = 0
+                        exit_price = tp1
 
-                    else:
+                        exit_reason = "TP1"
 
-                        # TP1
-                        if (
-                            not position["tp1_hit"]
-                            and
-                            high >= tp1
-                        ):
-
-                            qty = (
-                                position["initial_qty"]
-                                *
-                                tp1_fraction
-                            )
-
-                            exit_price = (
-                                tp1
-                                *
-                                (
-                                    1
-                                    -
-                                    slippage_pct
-                                    /
-                                    100
-                                )
-                            )
-
-                            pnl = (
-                                exit_price
-                                -
-                                entry
-                            ) * qty
-
-                            fee = (
-                                exit_price
-                                *
-                                qty
-                                *
-                                fee_pct
-                                /
-                                100
-                            )
-
-                            realized_pnl += (
-                                pnl - fee
-                            )
-
-                            remaining_qty -= qty
-
-                            position[
-                                "tp1_hit"
-                            ] = True
-
-                            events.append(
-                                "TP1"
-                            )
-
-                            if breakeven_after_tp1:
-
-                                position[
-                                    "stop"
-                                ] = entry
-
-                        # TP2
-                        if (
-                            position["tp1_hit"]
-                            and
-                            not position["tp2_hit"]
-                            and
-                            high >= tp2
-                        ):
-
-                            qty = (
-                                position["initial_qty"]
-                                *
-                                tp2_fraction
-                            )
-
-                            exit_price = (
-                                tp2
-                                *
-                                (
-                                    1
-                                    -
-                                    slippage_pct
-                                    /
-                                    100
-                                )
-                            )
-
-                            pnl = (
-                                exit_price
-                                -
-                                entry
-                            ) * qty
-
-                            fee = (
-                                exit_price
-                                *
-                                qty
-                                *
-                                fee_pct
-                                /
-                                100
-                            )
-
-                            realized_pnl += (
-                                pnl - fee
-                            )
-
-                            remaining_qty -= qty
-
-                            position[
-                                "tp2_hit"
-                            ] = True
-
-                            events.append(
-                                "TP2"
-                            )
-
-                        # TP3
-                        if (
-                            position["tp2_hit"]
-                            and
-                            not position["tp3_hit"]
-                            and
-                            high >= tp3
-                        ):
-
-                            qty = remaining_qty
-
-                            exit_price = (
-                                tp3
-                                *
-                                (
-                                    1
-                                    -
-                                    slippage_pct
-                                    /
-                                    100
-                                )
-                            )
-
-                            pnl = (
-                                exit_price
-                                -
-                                entry
-                            ) * qty
-
-                            fee = (
-                                exit_price
-                                *
-                                qty
-                                *
-                                fee_pct
-                                /
-                                100
-                            )
-
-                            realized_pnl += (
-                                pnl - fee
-                            )
-
-                            remaining_qty = 0
-
-                            position[
-                                "tp3_hit"
-                            ] = True
-
-                            events.append(
-                                "TP3"
-                            )
-
-                        # Trailing Stop
-                        if (
-                            remaining_qty > 0
-                            and
-                            position["tp1_hit"]
-                        ):
-
-                            new_stop = (
-                                close
-                                -
-                                atr * trailing_atr
-                            )
-
-                            if (
-                                new_stop
-                                >
-                                position["stop"]
-                            ):
-
-                                position[
-                                    "stop"
-                                ] = new_stop
-
-                # --------------------------------------------
+                # ---------------------------------------------
                 # SHORT
-                # --------------------------------------------
+                # ---------------------------------------------
 
-                else:
+                elif direction == "SHORT":
 
-                    if high >= stop:
+                    hit_sl = (
+                        high >= stop_loss
+                    )
 
-                        exit_price = (
-                            stop
-                            *
-                            (
-                                1
-                                +
-                                slippage_pct
-                                /
-                                100
-                            )
-                        )
+                    hit_tp = (
+                        low <= tp1
+                    )
 
-                        pnl = (
-                            entry
-                            -
-                            exit_price
-                        ) * remaining_qty
+                    if hit_sl:
 
-                        fee = (
-                            exit_price
-                            *
-                            remaining_qty
-                            *
-                            fee_pct
-                            /
-                            100
-                        )
+                        exit_price = stop_loss
 
-                        pnl -= fee
+                        exit_reason = "SL"
 
-                        realized_pnl += pnl
+                    elif hit_tp:
 
-                        events.append(
-                            "SL"
-                        )
+                        exit_price = tp1
 
-                        remaining_qty = 0
+                        exit_reason = "TP1"
 
-                    else:
+                # ---------------------------------------------
+                # EXIT
+                # ---------------------------------------------
 
-                        # TP1
-                        if (
-                            not position["tp1_hit"]
-                            and
-                            low <= tp1
-                        ):
-
-                            qty = (
-                                position["initial_qty"]
-                                *
-                                tp1_fraction
-                            )
-
-                            exit_price = (
-                                tp1
-                                *
-                                (
-                                    1
-                                    +
-                                    slippage_pct
-                                    /
-                                    100
-                                )
-                            )
-
-                            pnl = (
-                                entry
-                                -
-                                exit_price
-                            ) * qty
-
-                            fee = (
-                                exit_price
-                                *
-                                qty
-                                *
-                                fee_pct
-                                /
-                                100
-                            )
-
-                            realized_pnl += (
-                                pnl - fee
-                            )
-
-                            remaining_qty -= qty
-
-                            position[
-                                "tp1_hit"
-                            ] = True
-
-                            events.append(
-                                "TP1"
-                            )
-
-                            if breakeven_after_tp1:
-
-                                position[
-                                    "stop"
-                                ] = entry
-
-                        # TP2
-                        if (
-                            position["tp1_hit"]
-                            and
-                            not position["tp2_hit"]
-                            and
-                            low <= tp2
-                        ):
-
-                            qty = (
-                                position["initial_qty"]
-                                *
-                                tp2_fraction
-                            )
-
-                            exit_price = (
-                                tp2
-                                *
-                                (
-                                    1
-                                    +
-                                    slippage_pct
-                                    /
-                                    100
-                                )
-                            )
-
-                            pnl = (
-                                entry
-                                -
-                                exit_price
-                            ) * qty
-
-                            fee = (
-                                exit_price
-                                *
-                                qty
-                                *
-                                fee_pct
-                                /
-                                100
-                            )
-
-                            realized_pnl += (
-                                pnl - fee
-                            )
-
-                            remaining_qty -= qty
-
-                            position[
-                                "tp2_hit"
-                            ] = True
-
-                            events.append(
-                                "TP2"
-                            )
-
-                        # TP3
-                        if (
-                            position["tp2_hit"]
-                            and
-                            not position["tp3_hit"]
-                            and
-                            low <= tp3
-                        ):
-
-                            qty = remaining_qty
-
-                            exit_price = (
-                                tp3
-                                *
-                                (
-                                    1
-                                    +
-                                    slippage_pct
-                                    /
-                                    100
-                                )
-                            )
-
-                            pnl = (
-                                entry
-                                -
-                                exit_price
-                            ) * qty
-
-                            fee = (
-                                exit_price
-                                *
-                                qty
-                                *
-                                fee_pct
-                                /
-                                100
-                            )
-
-                            realized_pnl += (
-                                pnl - fee
-                            )
-
-                            remaining_qty = 0
-
-                            position[
-                                "tp3_hit"
-                            ] = True
-
-                            events.append(
-                                "TP3"
-                            )
-
-                        # Trailing
-                        if (
-                            remaining_qty > 0
-                            and
-                            position["tp1_hit"]
-                        ):
-
-                            new_stop = (
-                                close
-                                +
-                                atr * trailing_atr
-                            )
-
-                            if (
-                                new_stop
-                                <
-                                position["stop"]
-                            ):
-
-                                position[
-                                    "stop"
-                                ] = new_stop
-
-                # ------------------------------------------------
-                # TIME STOP
-                # ------------------------------------------------
-
-                if (
-                    remaining_qty > 0
-                    and
-                    position["bars"]
-                    >=
-                    max_bars_in_trade
-                ):
+                if exit_price is not None:
 
                     if direction == "LONG":
 
-                        exit_price = (
-                            close
-                            *
-                            (
-                                1
-                                -
-                                slippage_pct
-                                /
-                                100
-                            )
-                        )
-
-                        pnl = (
+                        raw_pnl = (
                             exit_price
                             -
-                            entry
-                        ) * remaining_qty
+                            entry_price
+                        ) * position_size
 
                     else:
 
-                        exit_price = (
-                            close
-                            *
-                            (
-                                1
-                                +
-                                slippage_pct
-                                /
-                                100
-                            )
-                        )
-
-                        pnl = (
-                            entry
+                        raw_pnl = (
+                            entry_price
                             -
                             exit_price
-                        ) * remaining_qty
+                        ) * position_size
 
-                    fee = (
+                    # Notional based fees
+                    entry_notional = (
+                        entry_price
+                        *
+                        position_size
+                    )
+
+                    exit_notional = (
                         exit_price
                         *
-                        remaining_qty
-                        *
-                        fee_pct
-                        /
-                        100
+                        position_size
                     )
 
-                    realized_pnl += (
-                        pnl - fee
+                    fees = (
+                        entry_notional
+                        +
+                        exit_notional
+                    ) * (
+                        fee_pct / 100
                     )
 
-                    remaining_qty = 0
-
-                    events.append(
-                        "TIME_STOP"
+                    net_pnl = (
+                        raw_pnl
+                        -
+                        fees
                     )
 
-                # ------------------------------------------------
-                # Update Position
-                # ------------------------------------------------
-
-                capital += realized_pnl
-
-                position[
-                    "remaining_qty"
-                ] = remaining_qty
-
-                position[
-                    "realized_pnl"
-                ] += realized_pnl
-
-                # ------------------------------------------------
-                # Close Trade
-                # ------------------------------------------------
-
-                if remaining_qty <= 1e-12:
-
-                    total_pnl = (
-                        position["realized_pnl"]
-                    )
-
-                    notional = (
-                        position["entry"]
-                        *
-                        position["initial_qty"]
-                    )
+                    capital += net_pnl
 
                     pnl_pct = (
-                        total_pnl
+                        net_pnl
                         /
                         max(
-                            notional,
+                            entry_notional,
                             1e-9
                         )
-                        *
-                        100
-                    )
+                    ) * 100
 
                     trades.append({
 
                         "entry_time":
-                            position["entry_time"],
+                            entry_time,
 
                         "exit_time":
                             row["timestamp"],
@@ -3003,19 +2432,49 @@ class BacktestEngine:
 
                         "entry":
                             round(
-                                position["entry"],
+                                entry_price,
                                 6
                             ),
 
-                        "initial_qty":
+                        "exit":
                             round(
-                                position["initial_qty"],
-                                8
+                                exit_price,
+                                6
                             ),
 
-                        "pnl":
+                        "stop":
                             round(
-                                total_pnl,
+                                stop_loss,
+                                6
+                            ),
+
+                        "tp":
+                            round(
+                                tp1,
+                                6
+                            ),
+
+                        "size":
+                            round(
+                                position_size,
+                                6
+                            ),
+
+                        "gross_pnl":
+                            round(
+                                raw_pnl,
+                                4
+                            ),
+
+                        "fees":
+                            round(
+                                fees,
+                                4
+                            ),
+
+                        "net_pnl":
+                            round(
+                                net_pnl,
                                 4
                             ),
 
@@ -3025,86 +2484,136 @@ class BacktestEngine:
                                 3
                             ),
 
-                        "events":
-                            ",".join(events),
-
-                        "bars":
-                            position["bars"],
-
                         "result":
                             (
                                 "WIN"
-                                if total_pnl > 0
+                                if net_pnl > 0
                                 else "LOSS"
-                            )
+                            ),
+
+                        "reason":
+                            exit_reason,
+
+                        "bars_held":
+                            i - entry_index
+
                     })
 
                     in_position = False
-                    position = None
 
-                # Continue to next candle
+                    direction = None
+
+                    entry_price = 0.0
+
+                    stop_loss = 0.0
+
+                    tp1 = 0.0
+
+                    position_size = 0.0
+
+                    entry_time = None
+
+                    entry_index = None
+
+            # =================================================
+            # EQUITY TRACKING
+            # =================================================
+
+            peak = max(
+                peak,
+                capital
+            )
+
+            drawdown = (
+                peak - capital
+            ) / max(
+                peak,
+                1e-9
+            ) * 100
+
+            max_drawdown = max(
+                max_drawdown,
+                drawdown
+            )
+
+            equity_curve.append({
+
+                "time":
+                    row["timestamp"],
+
+                "equity":
+                    capital,
+
+                "drawdown":
+                    drawdown
+
+            })
+
+            # =================================================
+            # NO NEW TRADE IF ACTIVE
+            # =================================================
+
+            if in_position:
                 continue
 
             # =================================================
-            # NEW SIGNAL
+            # LOCAL FEATURES
             # =================================================
 
-            prev = d.iloc[i - 1]
-
             prev_close = float(
-                prev["close"]
+                d["close"].iloc[i - 1]
             )
 
-            # -------------------------------------------------
-            # Reclaim
-            # -------------------------------------------------
+            prev_vwap = float(
+                d["vwap_session"].iloc[i - 1]
+            )
+
+            ema20 = (
+                d["close"]
+                .iloc[
+                    max(0, i - 100):
+                    i + 1
+                ]
+                .ewm(
+                    span=20,
+                    adjust=False
+                )
+                .mean()
+                .iloc[-1]
+            )
+
+            ema50 = (
+                d["close"]
+                .iloc[
+                    max(0, i - 150):
+                    i + 1
+                ]
+                .ewm(
+                    span=50,
+                    adjust=False
+                )
+                .mean()
+                .iloc[-1]
+            )
+
+            # =================================================
+            # SETUP
+            # =================================================
 
             bullish_reclaim = (
-                prev_close
-                <
-                float(prev["vwap"])
-                and
-                close
-                >
-                vwap
+                prev_close < prev_vwap
+                and close > vwap
             )
 
             bearish_reclaim = (
-                prev_close
-                >
-                float(prev["vwap"])
-                and
-                close
-                <
-                vwap
+                prev_close > prev_vwap
+                and close < vwap
             )
-
-            # -------------------------------------------------
-            # Volume
-            # -------------------------------------------------
-
-            volume_avg = (
-                d["volume"]
-                .iloc[
-                    max(0, i - 20):i
-                ]
-                .mean()
-            )
-
-            volume_expansion = (
-                row["volume"]
-                >
-                volume_avg * 1.5
-            )
-
-            # -------------------------------------------------
-            # Breakout
-            # -------------------------------------------------
 
             resistance = (
                 d["high"]
                 .iloc[
-                    max(0, i - 21):i
+                    i - 20:i
                 ]
                 .max()
             )
@@ -3112,154 +2621,323 @@ class BacktestEngine:
             support = (
                 d["low"]
                 .iloc[
-                    max(0, i - 21):i
+                    i - 20:i
                 ]
                 .min()
             )
 
+            volume_avg = (
+                d["volume"]
+                .iloc[
+                    i - 20:i
+                ]
+                .mean()
+            )
+
+            volume_ratio = (
+                d["volume"].iloc[i]
+                /
+                max(
+                    volume_avg,
+                    1e-9
+                )
+            )
+
             bullish_breakout = (
                 close > resistance
-                and
-                volume_expansion
+                and volume_ratio >= 1.5
             )
 
-            bearish_breakout = (
+            bearish_breakdown = (
                 close < support
-                and
-                volume_expansion
+                and volume_ratio >= 1.5
             )
 
-            # -------------------------------------------------
-            # Direction decision
-            # -------------------------------------------------
+            # =================================================
+            # TREND FILTER
+            # =================================================
 
-            direction = None
+            bullish_trend = (
+                close > ema20 > ema50
+            )
+
+            bearish_trend = (
+                close < ema20 < ema50
+            )
+
+            # =================================================
+            # ICHIMOKU
+            # =================================================
+
+            tenkan = d[
+                "tenkan"
+            ].iloc[i]
+
+            kijun = d[
+                "kijun"
+            ].iloc[i]
+
+            span_a = d[
+                "span_a"
+            ].iloc[i]
+
+            span_b = d[
+                "span_b"
+            ].iloc[i]
+
+            if pd.isna(span_a):
+                span_a = close
+
+            if pd.isna(span_b):
+                span_b = close
+
+            cloud_high = max(
+                span_a,
+                span_b
+            )
+
+            cloud_low = min(
+                span_a,
+                span_b
+            )
+
+            ichimoku_bull = (
+                close > cloud_high
+                and tenkan > kijun
+            )
+
+            ichimoku_bear = (
+                close < cloud_low
+                and tenkan < kijun
+            )
+
+            # =================================================
+            # QUANT SCORE
+            # =================================================
+
+            score = 0.0
+
+            # Trend
+            if bullish_trend:
+                score += 10
+
+            elif bearish_trend:
+                score -= 10
+
+            # Ichimoku
+            if ichimoku_bull:
+                score += 10
+
+            elif ichimoku_bear:
+                score -= 10
+
+            # VWAP location
+            distance_vwap = (
+                close - vwap
+            ) / max(
+                atr,
+                1e-9
+            )
+
+            if (
+                distance_vwap > 0
+                and distance_vwap < 2
+            ):
+
+                score += 5
+
+            elif (
+                distance_vwap < 0
+                and distance_vwap > -2
+            ):
+
+                score -= 5
+
+            # Volume
+            if volume_ratio >= 1.5:
+
+                if close > d[
+                    "open"
+                ].iloc[i]:
+
+                    score += 5
+
+                else:
+
+                    score -= 5
+
+            # =================================================
+            # ENTRY CONDITIONS
+            # =================================================
+
+            long_signal = False
+
+            short_signal = False
+
+            setup_name = ""
+
+            # -------------------------------------------------
+            # LONG RECLAIM
+            # -------------------------------------------------
 
             if bullish_reclaim:
 
+                setup_name = "VWAP_RECLAIM"
+
                 if (
-                    close
-                    >
-                    float(row["kijun"])
+                    close > ema20
+                    and close > kijun
+                    and (
+                        not use_trend_filter
+                        or bullish_trend
+                    )
+                    and score >= min_score
                 ):
 
-                    direction = "LONG"
+                    long_signal = True
+
+            # -------------------------------------------------
+            # SHORT RECLAIM
+            # -------------------------------------------------
 
             elif bearish_reclaim:
 
+                setup_name = "VWAP_REJECTION"
+
                 if (
-                    close
-                    <
-                    float(row["kijun"])
+                    close < ema20
+                    and close < kijun
+                    and (
+                        not use_trend_filter
+                        or bearish_trend
+                    )
+                    and score <= -min_score
                 ):
 
-                    direction = "SHORT"
+                    short_signal = True
+
+            # -------------------------------------------------
+            # BREAKOUT LONG
+            # -------------------------------------------------
 
             elif bullish_breakout:
 
+                setup_name = "BREAKOUT_LONG"
+
+                if (
+                    close > ema20
+                    and close > kijun
+                    and score >= min_score
+                ):
+
+                    long_signal = True
+
+            # -------------------------------------------------
+            # BREAKDOWN SHORT
+            # -------------------------------------------------
+
+            elif bearish_breakdown:
+
+                setup_name = "BREAKDOWN_SHORT"
+
+                if (
+                    close < ema20
+                    and close < kijun
+                    and score <= -min_score
+                ):
+
+                    short_signal = True
+
+            # =================================================
+            # ENTRY
+            # =================================================
+
+            if not (
+                long_signal
+                or
+                short_signal
+            ):
+
+                continue
+
+            # -------------------------------------------------
+            # DIRECTION
+            # -------------------------------------------------
+
+            if long_signal:
+
                 direction = "LONG"
 
-            elif bearish_breakout:
+            else:
 
                 direction = "SHORT"
 
             # -------------------------------------------------
-            # Enter
+            # SL / TP
             # -------------------------------------------------
 
-            if direction is None:
-                continue
+            risk_distance = (
+                atr * 1.5
+            )
 
-            # Avoid weak data
-            if (
-                pd.isna(atr)
-                or
-                atr <= 0
-            ):
-                continue
+            reward_distance = (
+                atr * 1.5
+            )
 
             # -------------------------------------------------
-            # Execution Slippage
+            # SLIPPAGE
             # -------------------------------------------------
 
             if direction == "LONG":
 
-                entry = (
+                entry_price = (
                     close
                     *
                     (
                         1
                         +
-                        slippage_pct
-                        /
-                        100
+                        slippage_pct / 100
                     )
                 )
 
-                stop = (
-                    entry
+                stop_loss = (
+                    entry_price
                     -
-                    atr * 1.5
+                    risk_distance
                 )
 
                 tp1 = (
-                    entry
+                    entry_price
                     +
-                    atr * 1.5
-                )
-
-                tp2 = (
-                    entry
-                    +
-                    atr * 2.5
-                )
-
-                tp3 = (
-                    entry
-                    +
-                    atr * 4.0
+                    reward_distance
                 )
 
             else:
 
-                entry = (
+                entry_price = (
                     close
                     *
                     (
                         1
                         -
-                        slippage_pct
-                        /
-                        100
+                        slippage_pct / 100
                     )
                 )
 
-                stop = (
-                    entry
+                stop_loss = (
+                    entry_price
                     +
-                    atr * 1.5
+                    risk_distance
                 )
 
                 tp1 = (
-                    entry
+                    entry_price
                     -
-                    atr * 1.5
-                )
-
-                tp2 = (
-                    entry
-                    -
-                    atr * 2.5
-                )
-
-                tp3 = (
-                    entry
-                    -
-                    atr * 4.0
+                    reward_distance
                 )
 
             # -------------------------------------------------
-            # Risk
+            # POSITION SIZE
             # -------------------------------------------------
 
             risk_amount = (
@@ -3270,239 +2948,44 @@ class BacktestEngine:
                 100
             )
 
-            risk_per_unit = abs(
-                entry - stop
-            )
-
-            if risk_per_unit <= 0:
-                continue
-
-            qty = (
+            position_size = (
                 risk_amount
                 /
-                risk_per_unit
+                max(
+                    risk_distance,
+                    1e-9
+                )
             )
 
             # -------------------------------------------------
-            # Entry fee
+            # AVOID IMPOSSIBLE POSITION
             # -------------------------------------------------
 
-            entry_fee = (
-                entry
-                *
-                qty
-                *
-                fee_pct
-                /
-                100
-            )
+            if (
+                position_size <= 0
+                or
+                not np.isfinite(
+                    position_size
+                )
+            ):
 
-            capital -= entry_fee
+                continue
 
             # -------------------------------------------------
-            # Position
+            # ACTIVATE
             # -------------------------------------------------
-
-            position = {
-
-                "direction":
-                    direction,
-
-                "entry_time":
-                    row["timestamp"],
-
-                "entry":
-                    entry,
-
-                "initial_qty":
-                    qty,
-
-                "remaining_qty":
-                    qty,
-
-                "stop":
-                    stop,
-
-                "tp1":
-                    tp1,
-
-                "tp2":
-                    tp2,
-
-                "tp3":
-                    tp3,
-
-                "tp1_hit":
-                    False,
-
-                "tp2_hit":
-                    False,
-
-                "tp3_hit":
-                    False,
-
-                "bars":
-                    0,
-
-                "realized_pnl":
-                    -entry_fee
-            }
 
             in_position = True
 
-        # ====================================================
-        # FINAL OPEN POSITION
-        # ====================================================
-
-        if in_position and position is not None:
-
-            row = d.iloc[-1]
-
-            close = float(
-                row["close"]
+            entry_time = (
+                row["timestamp"]
             )
 
-            direction = (
-                position["direction"]
-            )
+            entry_index = i
 
-            qty = (
-                position["remaining_qty"]
-            )
-
-            if direction == "LONG":
-
-                exit_price = (
-                    close
-                    *
-                    (
-                        1
-                        -
-                        slippage_pct
-                        /
-                        100
-                    )
-                )
-
-                pnl = (
-                    exit_price
-                    -
-                    position["entry"]
-                ) * qty
-
-            else:
-
-                exit_price = (
-                    close
-                    *
-                    (
-                        1
-                        +
-                        slippage_pct
-                        /
-                        100
-                    )
-                )
-
-                pnl = (
-                    position["entry"]
-                    -
-                    exit_price
-                ) * qty
-
-            fee = (
-                exit_price
-                *
-                qty
-                *
-                fee_pct
-                /
-                100
-            )
-
-            pnl -= fee
-
-            capital += pnl
-
-            total_pnl = (
-                position["realized_pnl"]
-                +
-                pnl
-            )
-
-            notional = (
-                position["entry"]
-                *
-                position["initial_qty"]
-            )
-
-            pnl_pct = (
-                total_pnl
-                /
-                max(
-                    notional,
-                    1e-9
-                )
-                *
-                100
-            )
-
-            trades.append({
-
-                "entry_time":
-                    position["entry_time"],
-
-                "exit_time":
-                    row["timestamp"],
-
-                "type":
-                    direction,
-
-                "entry":
-                    round(
-                        position["entry"],
-                        6
-                    ),
-
-                "initial_qty":
-                    round(
-                        position["initial_qty"],
-                        8
-                    ),
-
-                "pnl":
-                    round(
-                        total_pnl,
-                        4
-                    ),
-
-                "pnl_pct":
-                    round(
-                        pnl_pct,
-                        3
-                    ),
-
-                "events":
-                    "END_OF_DATA",
-
-                "bars":
-                    position["bars"],
-
-                "result":
-                    (
-                        "WIN"
-                        if total_pnl > 0
-                        else "LOSS"
-                    )
-            })
-
-        # ====================================================
-        # STATISTICS
-        # ====================================================
-
-        if not trades:
-
-            return BacktestResult()
+        # =====================================================
+        # FINAL RESULT
+        # =====================================================
 
         wins = [
             t
@@ -3516,9 +2999,9 @@ class BacktestEngine:
             if t["result"] == "LOSS"
         ]
 
-        gross_win = sum(
+        gross_profit = sum(
             max(
-                t["pnl"],
+                t["net_pnl"],
                 0
             )
             for t in trades
@@ -3527,7 +3010,7 @@ class BacktestEngine:
         gross_loss = abs(
             sum(
                 min(
-                    t["pnl"],
+                    t["net_pnl"],
                     0
                 )
                 for t in trades
@@ -3537,7 +3020,7 @@ class BacktestEngine:
         if gross_loss > 0:
 
             profit_factor = (
-                gross_win
+                gross_profit
                 /
                 gross_loss
             )
@@ -3545,8 +3028,8 @@ class BacktestEngine:
         else:
 
             profit_factor = (
-                gross_win
-                if gross_win > 0
+                gross_profit
+                if gross_profit > 0
                 else 0
             )
 
@@ -3556,139 +3039,82 @@ class BacktestEngine:
             len(trades)
             *
             100
+            if trades
+            else 0
         )
 
-        total_pnl = (
+        total_return = (
             capital
             -
             initial_capital
         )
 
-        total_pnl_pct = (
-            total_pnl
+        total_return_pct = (
+            total_return
             /
             initial_capital
             *
             100
         )
 
-        # ----------------------------------------------------
-        # Equity Curve
-        # ----------------------------------------------------
-
-        equity_df = pd.DataFrame(
-            equity_curve
-        )
-
-        if not equity_df.empty:
-
-            equity_df["equity"] = (
-                equity_df["equity"]
-                .astype(float)
-            )
-
-            equity_df["peak"] = (
-                equity_df["equity"]
-                .cummax()
-            )
-
-            equity_df["drawdown"] = (
-                (
-                    equity_df["equity"]
-                    -
-                    equity_df["peak"]
-                )
-                /
-                equity_df["peak"]
-                *
-                100
-            )
-
-            max_drawdown = abs(
-                equity_df["drawdown"].min()
-            )
-
-        # ----------------------------------------------------
-        # Sharpe
-        # ----------------------------------------------------
-
-        trade_returns = np.array([
-            t["pnl_pct"]
-            for t in trades
-        ])
-
-        if (
-            len(trade_returns) > 1
-            and
-            np.std(trade_returns) > 0
-        ):
-
-            sharpe = (
-                np.mean(trade_returns)
-                /
-                np.std(
-                    trade_returns,
-                    ddof=1
-                )
-                *
-                np.sqrt(
-                    len(trade_returns)
-                )
-            )
-
-        else:
-
-            sharpe = 0.0
-
-        avg_win = (
+        avg_trade = (
             np.mean(
                 [
                     t["pnl_pct"]
-                    for t in wins
+                    for t in trades
                 ]
             )
-            if wins
-            else 0.0
+            if trades
+            else 0
         )
 
-        avg_loss = (
-            np.mean(
-                [
-                    t["pnl_pct"]
-                    for t in losses
-                ]
-            )
-            if losses
-            else 0.0
-        )
+        expectancy = avg_trade
 
         return BacktestResult(
 
-            total_trades=len(trades),
+            initial_capital=initial_capital,
 
-            winning_trades=len(wins),
+            final_capital=capital,
 
-            losing_trades=len(losses),
+            total_trades=len(
+                trades
+            ),
+
+            winning_trades=len(
+                wins
+            ),
+
+            losing_trades=len(
+                losses
+            ),
 
             win_rate=win_rate,
 
-            total_pnl=total_pnl,
+            total_pnl_pct=(
+                total_return_pct
+            ),
 
-            total_pnl_pct=total_pnl_pct,
+            max_drawdown_pct=(
+                max_drawdown
+            ),
 
-            max_drawdown_pct=max_drawdown,
+            profit_factor=(
+                profit_factor
+            ),
 
-            profit_factor=profit_factor,
+            average_trade_pct=(
+                avg_trade
+            ),
 
-            sharpe_ratio=sharpe,
-
-            avg_win_pct=avg_win,
-
-            avg_loss_pct=avg_loss,
+            expectancy_pct=(
+                expectancy
+            ),
 
             trades_log=trades,
 
-            equity_curve=equity_curve
+            equity_curve=(
+                equity_curve
+            )
         )
 
 
@@ -3702,26 +3128,20 @@ def render_css():
         """
         <style>
 
-        .stSidebar,
-        div[data-testid="stSidebar"],
-        div[data-testid="stSidebar"] * {
-            word-break: normal !important;
-            word-wrap: normal !important;
-            white-space: normal !important;
-        }
-
-        .status {
-            padding: 4px 8px;
-            border-radius: 5px;
-            font-weight: bold;
-            font-size: 12px;
-        }
-
         .decision {
-            background: #1E222D;
-            padding: 18px;
-            border-radius: 8px;
-            border-left: 5px solid;
+
+            background:
+                #1E222D;
+
+            padding:
+                18px;
+
+            border-radius:
+                8px;
+
+            border-left:
+                5px solid;
+
         }
 
         </style>
@@ -3744,10 +3164,12 @@ def main():
 
     with st.sidebar:
 
-        st.title("⚡ AliQuantFund")
+        st.title(
+            "⚡ AliQuantFund"
+        )
 
         st.caption(
-            "Institutional Core Quant Engine v4.4"
+            "Institutional Engine v4.4"
         )
 
         st.markdown("---")
@@ -3759,10 +3181,7 @@ def main():
                 "ETH/USDT",
                 "ZEC/USDT",
                 "SOL/USDT",
-                "XRP/USDT",
-                "BNB/USDT",
-                "SUI/USDT",
-                "LTC/USDT"
+                "XRP/USDT"
             ]
         )
 
@@ -3790,18 +3209,12 @@ def main():
             "Risk per Trade (%)",
             min_value=0.1,
             max_value=10.0,
-            value=2.0,
+            value=1.0,
             step=0.5
         )
 
-        st.markdown("---")
-
-        st.subheader(
-            "Execution Model"
-        )
-
         fee_pct = st.number_input(
-            "Trading Fee (%)",
+            "Fee (%)",
             min_value=0.0,
             max_value=1.0,
             value=0.10,
@@ -3812,29 +3225,28 @@ def main():
             "Slippage (%)",
             min_value=0.0,
             max_value=1.0,
-            value=0.05,
+            value=0.03,
             step=0.01
         )
 
-        max_bars = st.number_input(
-            "Maximum Bars in Trade",
-            min_value=5,
-            max_value=500,
-            value=48,
-            step=5
+        min_score = st.slider(
+            "Minimum Backtest Score",
+            5,
+            30,
+            15
+        )
+
+        trend_filter = st.checkbox(
+            "Use Trend Filter",
+            value=True
         )
 
         st.markdown("---")
 
-        auto_refresh = st.checkbox(
-            "Auto Refresh",
-            value=True
-        )
-
         st.info(
-            "النظام لا ينفذ الصفقات. "
-            "هو محرك تحليل وإشارات وإدارة صفقة "
-            "واختبار خلفي."
+            "Backtest v4.4 يستخدم منطق "
+            "Setup + Trend + Ichimoku + VWAP "
+            "مع رسوم وانزلاق سعري."
         )
 
     # ========================================================
@@ -3842,7 +3254,7 @@ def main():
     # ========================================================
 
     with st.spinner(
-        f"جاري تحليل {symbol}..."
+        f"Analyzing {symbol}..."
     ):
 
         df, spot_status = (
@@ -3854,8 +3266,7 @@ def main():
         )
 
         futures, futures_status, funding = (
-            MarketDataLoader
-            .fetch_futures_metrics(
+            MarketDataLoader.fetch_futures_metrics(
                 symbol,
                 timeframe,
                 50
@@ -3863,8 +3274,7 @@ def main():
         )
 
         trades, cvd_status = (
-            MarketDataLoader
-            .fetch_recent_trades(
+            MarketDataLoader.fetch_recent_trades(
                 symbol
             )
         )
@@ -3875,7 +3285,7 @@ def main():
     ):
 
         st.error(
-            "❌ تعذر الحصول على بيانات السوق."
+            "❌ Market data unavailable."
         )
 
         return
@@ -3899,30 +3309,32 @@ def main():
     )
 
     vwap_session = (
-        QuantitativeEngine.vwap(
+        QuantitativeEngine
+        .vwap(
             df,
             "SESSION"
         )
     )
 
     vwap_weekly = (
-        QuantitativeEngine.vwap(
+        QuantitativeEngine
+        .vwap(
             df,
             "WEEKLY"
         )
     )
 
     vwap_monthly = (
-        QuantitativeEngine.vwap(
+        QuantitativeEngine
+        .vwap(
             df,
             "MONTHLY"
         )
     )
 
     anchor_idx, anchor_reason = (
-        QuantitativeEngine.smart_anchor(
-            df
-        )
+        QuantitativeEngine
+        .smart_anchor(df)
     )
 
     avwap = (
@@ -3933,11 +3345,20 @@ def main():
         )
     )
 
-    cvd_series, cvd_type, cvd_stats = (
-        QuantitativeEngine.cvd(
+    cvd_series, cvd_type = (
+        QuantitativeEngine
+        .cvd(
             df,
             trades,
             timeframe
+        )
+    )
+
+    cvd_stats = (
+        QuantitativeEngine
+        .cvd_stats(
+            df,
+            cvd_series
         )
     )
 
@@ -3949,30 +3370,31 @@ def main():
 
     if (
         futures is not None
-        and
-        len(futures) >= 2
+        and len(futures) >= 2
     ):
 
-        start = float(
+        start_oi = float(
             futures[
                 "openInterest"
             ].iloc[0]
         )
 
-        end = float(
+        end_oi = float(
             futures[
                 "openInterest"
             ].iloc[-1]
         )
 
-        if start != 0:
+        if start_oi != 0:
 
             oi_change = (
                 (
-                    end - start
+                    end_oi
+                    -
+                    start_oi
                 )
                 /
-                start
+                start_oi
                 *
                 100
             )
@@ -3997,10 +3419,6 @@ def main():
     close = float(
         df["close"].iloc[-1]
     )
-
-    # ========================================================
-    # METRICS
-    # ========================================================
 
     metrics = QuantitativeMetrics(
 
@@ -4038,10 +3456,14 @@ def main():
             cvd_stats["divergence"]
         ),
 
-        oi_change_pct=oi_change,
+        oi_change_pct=(
+            oi_change
+        ),
 
-        funding_rate=funding.get(
-            "current"
+        funding_rate=(
+            funding.get(
+                "current"
+            )
         ),
 
         tenkan=safe_last(
@@ -4066,54 +3488,47 @@ def main():
     )
 
     # ========================================================
-    # MARKET STATE
+    # LIVE ENGINE
     # ========================================================
 
     market_state = (
-        MarketStateEngine.classify(
+        MarketStateEngine
+        .classify(
             df,
             atr
         )
     )
 
-    # ========================================================
-    # MTF
-    # ========================================================
-
     htf = (
-        MultiTimeframeEngine.evaluate(
+        MultiTimeframeEngine
+        .evaluate(
             symbol
         )
     )
 
-    # ========================================================
-    # SETUP
-    # ========================================================
-
-    setup = SetupEngine.detect(
-        df,
-        metrics,
-        market_state,
-        htf
+    setup = (
+        SetupEngine
+        .detect(
+            df,
+            metrics,
+            market_state,
+            htf
+        )
     )
 
-    # ========================================================
-    # TRIGGER
-    # ========================================================
-
-    trigger = TriggerEngine.detect(
-        df,
-        metrics,
-        setup,
-        htf
+    trigger = (
+        TriggerEngine
+        .detect(
+            df,
+            metrics,
+            setup,
+            htf
+        )
     )
-
-    # ========================================================
-    # SCORE
-    # ========================================================
 
     scoring = (
-        FactorScoringEngine.score(
+        FactorScoringEngine
+        .score(
             market_state,
             df,
             metrics,
@@ -4123,30 +3538,26 @@ def main():
         )
     )
 
-    # ========================================================
-    # GRADE
-    # ========================================================
-
-    grade = SignalEngine.grade(
-        scoring.total_score,
-        setup,
-        trigger,
-        scoring.data_quality_pct,
-        htf
+    grade = (
+        SignalEngine
+        .grade(
+            scoring.total_score,
+            setup,
+            trigger,
+            scoring.data_quality_pct,
+            htf
+        )
     )
 
     # ========================================================
-    # FINAL DIRECTION
+    # FINAL DECISION
     # ========================================================
 
     if (
         trigger
-        ==
-        TriggerType.CONFIRMED_BUY
-        and
-        scoring.total_score >= 15
-        and
-        scoring.data_quality_pct >= 60
+        == TriggerType.CONFIRMED_BUY
+        and scoring.total_score >= 15
+        and scoring.data_quality_pct >= 60
     ):
 
         final_decision = (
@@ -4157,12 +3568,9 @@ def main():
 
     elif (
         trigger
-        ==
-        TriggerType.CONFIRMED_SELL
-        and
-        scoring.total_score <= -15
-        and
-        scoring.data_quality_pct >= 60
+        == TriggerType.CONFIRMED_SELL
+        and scoring.total_score <= -15
+        and scoring.data_quality_pct >= 60
     ):
 
         final_decision = (
@@ -4185,8 +3593,8 @@ def main():
 
     trade_plan = (
         TradeManagement.build(
-            df,
-            metrics,
+            close,
+            atr,
             direction,
             capital,
             risk_pct
@@ -4201,36 +3609,25 @@ def main():
         st.columns(4)
     )
 
-    with c1:
+    c1.metric(
+        "Symbol",
+        symbol
+    )
 
-        st.markdown(
-            f"### {symbol}"
-        )
+    c2.metric(
+        "Price",
+        f"${close:,.6f}"
+    )
 
-        st.caption(
-            f"Price: ${close:,.6f}"
-        )
+    c3.metric(
+        "Market State",
+        market_state.value
+    )
 
-    with c2:
-
-        st.metric(
-            "Market State",
-            market_state.value
-        )
-
-    with c3:
-
-        st.metric(
-            "Quant Score",
-            f"{scoring.total_score:+.1f}"
-        )
-
-    with c4:
-
-        st.metric(
-            "Data Quality",
-            f"{scoring.data_quality_pct:.0f}%"
-        )
+    c4.metric(
+        "Quant Score",
+        f"{scoring.total_score:+.1f}"
+    )
 
     st.markdown("---")
 
@@ -4240,47 +3637,58 @@ def main():
 
     if "LONG" in final_decision:
 
-        color = "#00E676"
+        decision_color = (
+            "#00E676"
+        )
 
     elif "SHORT" in final_decision:
 
-        color = "#FF5252"
+        decision_color = (
+            "#FF5252"
+        )
 
     else:
 
-        color = "#FFD600"
+        decision_color = (
+            "#FFD600"
+        )
 
     st.markdown(
         f"""
         <div class="decision"
-             style="border-color:{color}">
+             style="border-color:{decision_color}">
 
-            <h2 style="color:{color}">
-                {final_decision}
-            </h2>
+        <h2 style="color:{decision_color}">
+        {final_decision}
+        </h2>
 
-            <b>Setup:</b>
-            {setup.setup.value}
+        <b>Setup:</b>
+        {setup.setup.value}
 
-            &nbsp;&nbsp;|&nbsp;&nbsp;
+        &nbsp; | &nbsp;
 
-            <b>Trigger:</b>
-            {trigger.value}
+        <b>Trigger:</b>
+        {trigger.value}
 
-            <br><br>
+        &nbsp; | &nbsp;
 
-            <b>Signal Grade:</b>
-            {grade.value}
+        <b>Grade:</b>
+        {grade.value}
 
-            &nbsp;&nbsp;|&nbsp;&nbsp;
+        <br><br>
 
-            <b>HTF:</b>
-            {htf["context_bias"]}
+        <b>HTF Context:</b>
+        {htf["context_bias"]}
 
-            <br><br>
+        &nbsp; | &nbsp;
 
-            <b>Setup Reason:</b>
-            {setup.reason}
+        <b>Data Quality:</b>
+        {scoring.data_quality_pct:.0f}%
+
+        <br><br>
+
+        <b>Reason:</b>
+        {setup.reason}
 
         </div>
         """,
@@ -4288,18 +3696,18 @@ def main():
     )
 
     # ========================================================
-    # MTF
+    # MULTI TF
     # ========================================================
 
     st.markdown("---")
 
     st.subheader(
-        "🧭 Multi-Timeframe Hierarchy"
+        "🧭 Multi-Timeframe"
     )
 
     cols = st.columns(5)
 
-    for i, tf in enumerate(
+    for idx, tf in enumerate(
         [
             "1d",
             "4h",
@@ -4313,18 +3721,18 @@ def main():
             htf["frames"][tf]
         )
 
-        cols[i].metric(
+        cols[idx].metric(
             tf.upper(),
             frame["bias"],
             f'{frame["score"]:.0f}'
         )
 
     # ========================================================
-    # SCORE
+    # SCORING
     # ========================================================
 
     with st.expander(
-        "🧩 Layered Quantitative Scoring",
+        "🧩 Quantitative Scoring",
         expanded=True
     ):
 
@@ -4365,66 +3773,61 @@ def main():
     if direction == "NONE":
 
         st.warning(
-            "لا توجد صفقة مؤكدة حالياً."
+            "No confirmed trade."
         )
 
     else:
 
-        t1, t2, t3, t4 = (
+        a, b, c, d_ = (
             st.columns(4)
         )
 
-        t1.metric(
+        a.metric(
             "Entry",
-            f"{trade_plan.entry_low:,.6f}"
-            f" – "
-            f"{trade_plan.entry_high:,.6f}"
+            (
+                f"{trade_plan.entry_low:.6f}"
+                f" - "
+                f"{trade_plan.entry_high:.6f}"
+            )
         )
 
-        t2.metric(
-            "Stop Loss",
-            f"{trade_plan.stop_loss:,.6f}"
+        b.metric(
+            "SL",
+            f"{trade_plan.stop_loss:.6f}"
         )
 
-        t3.metric(
+        c.metric(
             "TP1",
-            f"{trade_plan.tp1:,.6f}"
+            f"{trade_plan.tp1:.6f}"
         )
 
-        t4.metric(
-            "R:R TP1",
+        d_.metric(
+            "R:R",
             f"1:{trade_plan.rr_tp1:.2f}"
         )
 
-        t5, t6, t7, t8 = (
+        e, f, g, h = (
             st.columns(4)
         )
 
-        t5.metric(
+        e.metric(
             "TP2",
-            f"{trade_plan.tp2:,.6f}"
+            f"{trade_plan.tp2:.6f}"
         )
 
-        t6.metric(
-            "R:R TP2",
-            f"1:{trade_plan.rr_tp2:.2f}"
-        )
-
-        t7.metric(
+        f.metric(
             "TP3",
-            f"{trade_plan.tp3:,.6f}"
+            f"{trade_plan.tp3:.6f}"
         )
 
-        t8.metric(
+        g.metric(
             "Position Size",
             f"{trade_plan.position_size:.6f}"
         )
 
-        st.info(
-            f"💰 Risk Amount: "
+        h.metric(
+            "Risk",
             f"${trade_plan.risk_amount:.2f}"
-            f" | "
-            f"{trade_plan.invalidation}"
         )
 
     # ========================================================
@@ -4437,14 +3840,20 @@ def main():
         "🧪 Backtesting Engine v4.4"
     )
 
-    bt_result = (
+    st.caption(
+        "Historical simulation using the same core "
+        "structural logic: VWAP + trend + Ichimoku + volume."
+    )
+
+    bt = (
         BacktestEngine.run_backtest(
             df,
-            capital,
-            risk_pct,
-            fee_pct,
-            slippage_pct,
-            max_bars_in_trade=max_bars
+            initial_capital=capital,
+            risk_pct=risk_pct,
+            fee_pct=fee_pct,
+            slippage_pct=slippage_pct,
+            min_score=min_score,
+            use_trend_filter=trend_filter
         )
     )
 
@@ -4454,68 +3863,68 @@ def main():
 
     b1.metric(
         "Trades",
-        bt_result.total_trades
+        bt.total_trades
     )
 
     b2.metric(
         "Win Rate",
-        f"{bt_result.win_rate:.1f}%"
+        f"{bt.win_rate:.1f}%"
     )
 
     b3.metric(
         "Return",
-        f"{bt_result.total_pnl_pct:+.2f}%"
+        f"{bt.total_pnl_pct:+.2f}%"
     )
 
     b4.metric(
         "Max DD",
-        f"{bt_result.max_drawdown_pct:.2f}%"
+        f"{bt.max_drawdown_pct:.2f}%"
     )
 
     b5.metric(
         "Profit Factor",
-        f"{bt_result.profit_factor:.2f}"
+        f"{bt.profit_factor:.2f}"
     )
 
-    b6, b7, b8 = (
+    x1, x2, x3 = (
         st.columns(3)
     )
 
-    b6.metric(
-        "Sharpe",
-        f"{bt_result.sharpe_ratio:.2f}"
+    x1.metric(
+        "Final Capital",
+        f"${bt.final_capital:.2f}"
     )
 
-    b7.metric(
-        "Average Win",
-        f"{bt_result.avg_win_pct:+.2f}%"
+    x2.metric(
+        "Average Trade",
+        f"{bt.average_trade_pct:+.3f}%"
     )
 
-    b8.metric(
-        "Average Loss",
-        f"{bt_result.avg_loss_pct:+.2f}%"
+    x3.metric(
+        "Expectancy",
+        f"{bt.expectancy_pct:+.3f}%"
     )
 
     # ========================================================
     # EQUITY CURVE
     # ========================================================
 
-    if bt_result.equity_curve:
+    if bt.equity_curve:
 
-        st.subheader(
-            "📈 Backtest Equity Curve"
+        eq = pd.DataFrame(
+            bt.equity_curve
         )
 
-        equity_df = pd.DataFrame(
-            bt_result.equity_curve
+        st.subheader(
+            "📈 Equity Curve"
         )
 
         fig_eq = go.Figure()
 
         fig_eq.add_trace(
             go.Scatter(
-                x=equity_df["time"],
-                y=equity_df["equity"],
+                x=eq["time"],
+                y=eq["equity"],
                 mode="lines",
                 name="Equity"
             )
@@ -4525,13 +3934,7 @@ def main():
             template="plotly_dark",
             height=350,
             xaxis_title="Time",
-            yaxis_title="Capital",
-            margin=dict(
-                l=10,
-                r=10,
-                t=20,
-                b=10
-            )
+            yaxis_title="Capital"
         )
 
         st.plotly_chart(
@@ -4543,16 +3946,16 @@ def main():
     # TRADE LOG
     # ========================================================
 
-    if bt_result.trades_log:
+    if bt.trades_log:
 
         with st.expander(
-            "📋 Detailed Backtest Trade Log",
+            "📋 Backtest Trade Log",
             expanded=False
         ):
 
             st.dataframe(
                 pd.DataFrame(
-                    bt_result.trades_log
+                    bt.trades_log
                 ),
                 use_container_width=True
             )
@@ -4562,11 +3965,11 @@ def main():
     # ========================================================
 
     with st.expander(
-        "🔧 Engine Diagnostics",
+        "🔧 Diagnostics",
         expanded=False
     ):
 
-        diagnostics = {
+        st.json({
 
             "Market State":
                 market_state.value,
@@ -4574,25 +3977,22 @@ def main():
             "Setup":
                 setup.setup.value,
 
-            "Setup Reason":
-                setup.reason,
-
             "Trigger":
                 trigger.value,
 
-            "Signal Grade":
+            "Grade":
                 grade.value,
 
-            "HTF Context":
+            "HTF":
                 htf["context_bias"],
 
             "Execution Score":
                 round(
                     htf["execution_score"],
-                    1
+                    2
                 ),
 
-            "CVD Type":
+            "CVD":
                 cvd_type,
 
             "CVD Slope":
@@ -4607,40 +4007,31 @@ def main():
             "OI Change":
                 round(
                     metrics.oi_change_pct,
-                    2
+                    3
                 ),
 
             "Funding":
                 metrics.funding_rate,
 
-            "Anchor":
-                anchor_reason,
-
-            "Spot Data":
+            "Spot":
                 spot_status,
 
-            "Futures Data":
+            "Futures":
                 futures_status,
 
-            "Data Quality":
-                scoring.data_quality_pct,
-
-            "Trading Fee":
+            "Backtest Fee":
                 fee_pct,
 
-            "Slippage":
+            "Backtest Slippage":
                 slippage_pct,
 
-            "Max Bars":
-                max_bars
-        }
+            "Backtest Minimum Score":
+                min_score
 
-        st.json(
-            diagnostics
-        )
+        })
 
     # ========================================================
-    # VWAP PANEL
+    # VWAP
     # ========================================================
 
     with st.expander(
@@ -4654,24 +4045,27 @@ def main():
 
         v1.metric(
             "Session VWAP",
-            f"{metrics.vwap_session:,.6f}"
+            f"{metrics.vwap_session:.6f}"
         )
 
         v2.metric(
             "Weekly VWAP",
-            f"{metrics.vwap_weekly:,.6f}"
+            f"{metrics.vwap_weekly:.6f}"
         )
 
         v3.metric(
             "Monthly VWAP",
-            f"{metrics.vwap_monthly:,.6f}"
+            f"{metrics.vwap_monthly:.6f}"
         )
 
-        if metrics.vwap_anchored:
+        if (
+            metrics.vwap_anchored
+            is not None
+        ):
 
             v4.metric(
                 "Anchored VWAP",
-                f"{metrics.vwap_anchored:,.6f}"
+                f"{metrics.vwap_anchored:.6f}"
             )
 
     # ========================================================
@@ -4681,121 +4075,183 @@ def main():
     st.markdown("---")
 
     st.subheader(
-        f"📈 {symbol} — Institutional Chart"
+        f"📈 {symbol} Institutional Chart"
     )
 
     fig = make_subplots(
+
         rows=2,
+
         cols=1,
+
         shared_xaxes=True,
+
         vertical_spacing=0.03,
+
         row_heights=[
             0.70,
             0.30
         ]
+
     )
 
     # --------------------------------------------------------
-    # Price
+    # PRICE
     # --------------------------------------------------------
 
     fig.add_trace(
+
         go.Candlestick(
+
             x=df["timestamp"],
+
             open=df["open"],
+
             high=df["high"],
+
             low=df["low"],
+
             close=df["close"],
+
             name="Price"
+
         ),
+
         row=1,
         col=1
+
     )
 
     # --------------------------------------------------------
-    # Ichimoku
+    # ICHIMOKU
     # --------------------------------------------------------
 
     fig.add_trace(
+
         go.Scatter(
+
             x=df["timestamp"],
+
             y=df["tenkan"],
+
             name="Tenkan",
+
             mode="lines"
+
         ),
+
         row=1,
         col=1
+
     )
 
     fig.add_trace(
+
         go.Scatter(
+
             x=df["timestamp"],
+
             y=df["kijun"],
+
             name="Kijun",
+
             mode="lines"
+
         ),
+
         row=1,
         col=1
+
     )
 
     # --------------------------------------------------------
-    # VWAP
+    # VWAPS
     # --------------------------------------------------------
 
     fig.add_trace(
+
         go.Scatter(
+
             x=df["timestamp"],
+
             y=vwap_session,
+
             name="Session VWAP",
+
             mode="lines"
+
         ),
+
         row=1,
         col=1
+
     )
 
     fig.add_trace(
+
         go.Scatter(
+
             x=df["timestamp"],
+
             y=vwap_weekly,
+
             name="Weekly VWAP",
+
             mode="lines",
+
             line=dict(
                 dash="dash"
             )
+
         ),
+
         row=1,
         col=1
+
     )
 
     fig.add_trace(
+
         go.Scatter(
+
             x=df["timestamp"],
+
             y=vwap_monthly,
+
             name="Monthly VWAP",
+
             mode="lines",
+
             line=dict(
                 dash="dot"
             )
+
         ),
+
         row=1,
         col=1
-    )
 
-    # --------------------------------------------------------
-    # Anchored VWAP
-    # --------------------------------------------------------
+    )
 
     if not avwap.isna().all():
 
         fig.add_trace(
+
             go.Scatter(
+
                 x=df["timestamp"],
+
                 y=avwap,
-                name="Smart Anchored VWAP",
+
+                name="Anchored VWAP",
+
                 mode="lines"
+
             ),
+
             row=1,
             col=1
+
         )
 
     # --------------------------------------------------------
@@ -4803,64 +4259,101 @@ def main():
     # --------------------------------------------------------
 
     fig.add_trace(
+
         go.Scatter(
+
             x=df["timestamp"],
+
             y=cvd_series,
+
             name=f"CVD ({cvd_type})",
+
             mode="lines"
+
         ),
+
         row=2,
         col=1
+
     )
 
     # --------------------------------------------------------
-    # Trade Levels
+    # TRADE LEVELS
     # --------------------------------------------------------
 
     if direction != "NONE":
 
         fig.add_hline(
+
             y=trade_plan.stop_loss,
+
             line_dash="dash",
+
             annotation_text="SL",
+
             row=1,
+
             col=1
+
         )
 
         fig.add_hline(
+
             y=trade_plan.tp1,
+
             line_dash="dot",
+
             annotation_text="TP1",
+
             row=1,
+
             col=1
+
         )
 
         fig.add_hline(
+
             y=trade_plan.tp2,
+
             line_dash="dot",
+
             annotation_text="TP2",
+
             row=1,
+
             col=1
+
         )
 
         fig.add_hline(
+
             y=trade_plan.tp3,
+
             line_dash="dot",
+
             annotation_text="TP3",
+
             row=1,
+
             col=1
+
         )
 
     fig.update_layout(
+
         template="plotly_dark",
+
         height=750,
+
         margin=dict(
             l=10,
             r=10,
             t=20,
             b=10
         ),
+
         xaxis_rangeslider_visible=False,
+
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -4868,6 +4361,7 @@ def main():
             xanchor="right",
             x=1
         )
+
     )
 
     st.plotly_chart(
