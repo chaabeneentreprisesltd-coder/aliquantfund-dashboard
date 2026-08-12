@@ -99,6 +99,24 @@ def safe_last(series: pd.Series, default=0.0):
         return default
 
 
+def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> Tuple[bool, str]:
+    """Sends a message via the Telegram Bot API. Never raises — returns (success, info)."""
+    if not bot_token or not chat_id:
+        return False, "لم يتم إدخال Bot Token أو Chat ID."
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        res = requests.post(url, json={
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=6)
+        if res.status_code == 200 and res.json().get("ok"):
+            return True, "sent"
+        return False, f"Telegram API error: {res.text[:200]}"
+    except Exception as e:
+        return False, f"فشل الإرسال: {e}"
+
+
 # ==========================================
 # 1. DATA STRUCTURES & DATA LAYER
 # ==========================================
@@ -1294,6 +1312,29 @@ st.sidebar.subheader("📐 إدارة رأس المال")
 capital = st.sidebar.number_input("رأس المال ($):", value=100.0, step=10.0)
 base_risk_pct = st.sidebar.number_input("أقصى نسبة مخاطرة (%):", value=2.0, step=0.5)
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("📲 تنبيهات تيليغرام")
+telegram_enabled = st.sidebar.checkbox("تفعيل الإرسال إلى تيليغرام", value=False)
+default_token, default_chat = "", ""
+try:
+    if hasattr(st, "secrets"):
+        default_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+        default_chat = st.secrets.get("TELEGRAM_CHAT_ID", "")
+except Exception:
+    pass
+telegram_token = st.sidebar.text_input("Bot Token:", value=default_token, type="password")
+telegram_chat_id = st.sidebar.text_input("Chat ID:", value=default_chat)
+alert_on_setup_forming = st.sidebar.checkbox("تنبيه أيضاً عند SETUP FORMING", value=False)
+
+auto_refresh_enabled = st.sidebar.checkbox("تحديث تلقائي دوري (لمراقبة السوق باستمرار)", value=False)
+refresh_seconds = st.sidebar.selectbox("فترة التحديث:", [30, 60, 120, 300], index=1, disabled=not auto_refresh_enabled)
+
+if telegram_enabled and (not telegram_token or not telegram_chat_id):
+    st.sidebar.warning("⚠️ أدخل Bot Token وChat ID لتفعيل التنبيهات.")
+
+if "telegram_last_alert" not in st.session_state:
+    st.session_state["telegram_last_alert"] = {}  # key: f"{symbol}_{tf}" -> last decision alerted
+
 st.title(f"📊 التحليل الكمي المؤسسي: {selected_symbol}")
 
 try:
@@ -1332,6 +1373,40 @@ if spot_df is not None and not spot_df.empty:
         final = SignalAndRiskEngine.build_final_decision(
             factors['raw_score'], data_quality, mft_res, active_setup, market_state['state']
         )
+
+        # --- Telegram Alerting ---
+        # Fires only on a *change* into an alert-worthy decision for this symbol+timeframe,
+        # so the same signal isn't re-sent on every rerun/auto-refresh.
+        alertable_decisions = {"CONFIRMED LONG", "CONFIRMED SHORT"}
+        if alert_on_setup_forming:
+            alertable_decisions.add("SETUP FORMING")
+
+        alert_key = f"{selected_symbol}_{selected_tf}"
+        last_alerted = st.session_state["telegram_last_alert"].get(alert_key)
+
+        if telegram_enabled and telegram_token and telegram_chat_id:
+            if final['decision'] in alertable_decisions and final['decision'] != last_alerted:
+                direction_emoji = "🟢" if "LONG" in final['decision'] else ("🔴" if "SHORT" in final['decision'] else "🟡")
+                msg_lines = [
+                    f"{direction_emoji} <b>{final['decision']}</b> — {selected_symbol} ({selected_tf})",
+                    f"Market State: {market_state['state']}",
+                    f"HTF Bias: {mft_res['context_bias']}",
+                    f"Active Setup: {active_setup['type'] if active_setup else '—'}",
+                    f"Trigger: {mft_res.get('trigger_desc') or '—'}",
+                    f"Confidence: {final['confidence']}% | Data Quality: {data_quality}%",
+                    f"Price: ${spot_df['close'].iloc[-1]:.4f}",
+                ]
+                if final['reasons']:
+                    msg_lines.append("Reason: " + final['reasons'][0])
+                sent_ok, sent_info = send_telegram_alert(telegram_token, telegram_chat_id, "\n".join(msg_lines))
+                if sent_ok:
+                    st.session_state["telegram_last_alert"][alert_key] = final['decision']
+                    st.toast("✅ تم إرسال تنبيه تيليغرام", icon="📲")
+                else:
+                    st.sidebar.error(f"فشل إرسال تنبيه تيليغرام: {sent_info}")
+            elif final['decision'] not in alertable_decisions and last_alerted is not None:
+                # Decision faded back to non-actionable — reset so a future re-entry alerts again
+                st.session_state["telegram_last_alert"][alert_key] = None
 
         badge_class = "status-badge-live" if spot_status == DataStatus.LIVE else "status-badge-fallback"
         futures_badge = "status-badge-live" if futures_status == DataStatus.LIVE else "status-badge-bad"
@@ -1503,3 +1578,10 @@ else:
 
 st.markdown("---")
 st.caption("⚡ AliQuantFund Institutional Architecture v4.0 — Market State + Setup Detection Engine | All Rights Reserved")
+
+if auto_refresh_enabled:
+    st.caption(f"🔄 التحديث التلقائي مفعّل كل {refresh_seconds} ثانية — أبقِ هذا التبويب مفتوحاً ليستمر فحص السوق وإرسال تنبيهات تيليغرام.")
+    st.components.v1.html(
+        f"<script>setTimeout(function(){{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});</script>",
+        height=0
+    )
