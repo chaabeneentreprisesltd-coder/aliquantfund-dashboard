@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-⚡ AliQuantFund Institutional Architecture v4.3
-================================================
+⚡ AliQuantFund Institutional Architecture v4.3 (with Backtesting Engine)
+========================================================================
 MASTER INTEGRATION
 
 DATA
@@ -27,19 +27,16 @@ DECISION
  ├─ Signal Grade
  └─ Trade Management
 
-TRADE MANAGEMENT
- ├─ Entry Zone
- ├─ Stop Loss
- ├─ TP1 / TP2 / TP3
- ├─ Risk / Reward
- ├─ Position Size
- └─ Invalidation
+BACKTESTING
+ ├─ Historical Simulation
+ ├─ Win Rate / Drawdown / Profit Factor
+ └─ Detailed Trade Log
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple, Any, List
 
 import numpy as np
 import pandas as pd
@@ -167,6 +164,18 @@ class TradePlan:
     position_size: Optional[float] = None
     risk_amount: Optional[float] = None
     invalidation: str = "No active trade plan"
+
+
+@dataclass
+class BacktestResult:
+    total_trades: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    win_rate: float = 0.0
+    total_pnl_pct: float = 0.0
+    max_drawdown_pct: float = 0.0
+    profit_factor: float = 0.0
+    trades_log: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ============================================================
@@ -1812,6 +1821,133 @@ class TradeManagement:
 
 
 # ============================================================
+# 11.5 BACKTESTING ENGINE
+# ============================================================
+
+class BacktestEngine:
+
+    @staticmethod
+    def run_backtest(df, initial_capital=100.0, risk_pct=2.0) -> BacktestResult:
+        if df is None or len(df) < 60:
+            return BacktestResult()
+
+        d = df.copy().reset_index(drop=True)
+        d = QuantitativeEngine.ichimoku(d)
+        atr_series = QuantitativeEngine.atr(d)
+        vwap_session = QuantitativeEngine.vwap(d, "SESSION")
+
+        capital = initial_capital
+        peak_capital = initial_capital
+        max_drawdown = 0.0
+
+        trades = []
+        in_position = False
+        pos_type = None
+        entry_price = 0.0
+        stop_loss = 0.0
+        take_profit = 0.0
+        pos_size = 0.0
+
+        for i in range(50, len(d)):
+            current_row = d.iloc[i]
+            prev_row = d.iloc[i-1]
+            close = current_row["close"]
+            high = current_row["high"]
+            low = current_row["low"]
+            atr = atr_series.iloc[i]
+            vwap = vwap_session.iloc[i]
+
+            # 1. Management of Active Position
+            if in_position:
+                pnl = 0.0
+                closed = False
+                reason = ""
+
+                if pos_type == "LONG":
+                    if low <= stop_loss:
+                        pnl = (stop_loss - entry_price) * pos_size
+                        closed = True
+                        reason = "SL"
+                    elif high >= take_profit:
+                        pnl = (take_profit - entry_price) * pos_size
+                        closed = True
+                        reason = "TP1"
+                elif pos_type == "SHORT":
+                    if high >= stop_loss:
+                        pnl = (entry_price - stop_loss) * pos_size
+                        closed = True
+                        reason = "SL"
+                    elif low <= take_profit:
+                        pnl = (entry_price - take_profit) * pos_size
+                        closed = True
+                        reason = "TP1"
+
+                if closed:
+                    capital += pnl
+                    trades.append({
+                        "time": current_row["timestamp"],
+                        "type": pos_type,
+                        "entry": round(entry_price, 4),
+                        "exit": round(stop_loss if reason == "SL" else take_profit, 4),
+                        "pnl": round(pnl, 2),
+                        "pnl_pct": round((pnl / (entry_price * pos_size)) * 100, 2),
+                        "result": "WIN" if pnl > 0 else "LOSS",
+                        "reason": reason
+                    })
+                    in_position = False
+
+                    if capital > peak_capital:
+                        peak_capital = capital
+                    dd = (peak_capital - capital) / peak_capital * 100
+                    if dd > max_drawdown:
+                        max_drawdown = dd
+
+            # 2. Setup Evaluation
+            if not in_position:
+                bullish_reclaim = (prev_row["close"] < vwap) and (close > vwap)
+                bearish_reclaim = (prev_row["close"] > vwap) and (close < vwap)
+
+                risk_amt = capital * (risk_pct / 100.0)
+
+                if bullish_reclaim and close > d.iloc[i]["kijun"]:
+                    in_position = True
+                    pos_type = "LONG"
+                    entry_price = close
+                    stop_loss = entry_price - (atr * 1.5)
+                    take_profit = entry_price + (atr * 1.5)
+                    pos_size = risk_amt / max(entry_price - stop_loss, 1e-9)
+
+                elif bearish_reclaim and close < d.iloc[i]["kijun"]:
+                    in_position = True
+                    pos_type = "SHORT"
+                    entry_price = close
+                    stop_loss = entry_price + (atr * 1.5)
+                    take_profit = entry_price - (atr * 1.5)
+                    pos_size = risk_amt / max(stop_loss - entry_price, 1e-9)
+
+        wins = [t for t in trades if t["result"] == "WIN"]
+        losses = [t for t in trades if t["result"] == "LOSS"]
+
+        total_gross_win = sum(t["pnl"] for t in wins)
+        total_gross_loss = abs(sum(t["pnl"] for t in losses))
+
+        profit_factor = (total_gross_win / total_gross_loss) if total_gross_loss > 0 else (total_gross_win if total_gross_win > 0 else 0.0)
+        win_rate = (len(wins) / len(trades) * 100) if trades else 0.0
+        total_pnl_pct = ((capital - initial_capital) / initial_capital) * 100
+
+        return BacktestResult(
+            total_trades=len(trades),
+            winning_trades=len(wins),
+            losing_trades=len(losses),
+            win_rate=win_rate,
+            total_pnl_pct=total_pnl_pct,
+            max_drawdown_pct=max_drawdown,
+            profit_factor=profit_factor,
+            trades_log=trades
+        )
+
+
+# ============================================================
 # 12. CSS
 # ============================================================
 
@@ -1934,7 +2070,7 @@ def main():
 
         st.info(
             "النظام لا ينفذ الصفقات. "
-            "هو محرك تحليل وإشارات وإدارة صفقة."
+            "هو محرك تحليل وإشارات وإدارة صفقة واختبار خلفي."
         )
 
     # ========================================================
@@ -2467,6 +2603,27 @@ def main():
             f" | "
             f"{trade_plan.invalidation}"
         )
+
+    # ========================================================
+    # BACKTESTING ENGINE SECTION
+    # ========================================================
+
+    st.markdown("---")
+    st.subheader("🧪 Backtesting Engine (Historical Performance)")
+
+    bt_result = BacktestEngine.run_backtest(df, capital, risk_pct)
+
+    b1, b2, b3, b4, b5 = st.columns(5)
+
+    b1.metric("Total Trades", bt_result.total_trades)
+    b2.metric("Win Rate", f"{bt_result.win_rate:.1f}%")
+    b3.metric("Total Return", f"{bt_result.total_pnl_pct:+.2f}%")
+    b4.metric("Max Drawdown", f"{bt_result.max_drawdown_pct:.2f}%")
+    b5.metric("Profit Factor", f"{bt_result.profit_factor:.2f}")
+
+    if bt_result.trades_log:
+        with st.expander("📋 View Detailed Backtest Trades Log", expanded=False):
+            st.dataframe(pd.DataFrame(bt_result.trades_log), use_container_width=True)
 
     # ========================================================
     # MARKET DATA DIAGNOSTICS
