@@ -1,30 +1,39 @@
 # -*- coding: utf-8 -*-
 """
 ⚡ AliQuantFund Institutional Architecture v4.3
-=================================================
+================================================
 MASTER INTEGRATION
 
-Integrated:
-- Multi-TF Hierarchy
-- Market State Engine
-- Setup Detection
-- Trigger Engine
-- Signal Grade
-- Ichimoku
-- Session / Weekly / Monthly VWAP
-- Smart Anchored VWAP
-- CVD Real / Approx
-- Futures OI
-- Funding Rate
-- Anti-Double Counting
-- Entry Zone
-- Stop Loss
-- TP1 / TP2 / TP3
-- Position Sizing
-- Risk / Reward
-- Trade Management
-- Trailing Stop Reference
-- Data Quality
+DATA
+ ├─ Binance Spot / Bybit fallback
+ ├─ Binance Futures OI + Funding / Bybit fallback
+ └─ Binance Trade Tape
+
+ANALYSIS
+ ├─ ATR
+ ├─ Ichimoku
+ ├─ Session / Weekly / Monthly VWAP
+ ├─ Smart Anchored VWAP
+ ├─ Real / Approx CVD
+ ├─ OI + Funding
+ └─ Multi-Timeframe 1D → 4H → 1H → 15M → 5M
+
+DECISION
+ ├─ Market State
+ ├─ HTF Context
+ ├─ Setup Detection
+ ├─ Trigger Detection
+ ├─ Layered Quant Score
+ ├─ Signal Grade
+ └─ Trade Management
+
+TRADE MANAGEMENT
+ ├─ Entry Zone
+ ├─ Stop Loss
+ ├─ TP1 / TP2 / TP3
+ ├─ Risk / Reward
+ ├─ Position Size
+ └─ Invalidation
 """
 
 import logging
@@ -40,12 +49,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-# ============================================================================
+# ============================================================
 # 0. CONFIGURATION
-# ============================================================================
+# ============================================================
 
 st.set_page_config(
-    page_title="AliQuantFund - Institutional Engine v4.3",
+    page_title="AliQuantFund - Master Engine v4.3",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -59,9 +68,9 @@ logging.basicConfig(
 logger = logging.getLogger("AliQuantFund")
 
 
-# ============================================================================
+# ============================================================
 # 1. ENUMS
-# ============================================================================
+# ============================================================
 
 class MarketState(Enum):
     TRENDING_BULL = "TRENDING_BULL"
@@ -100,9 +109,9 @@ class DataStatus(Enum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
-# ============================================================================
+# ============================================================
 # 2. DATA STRUCTURES
-# ============================================================================
+# ============================================================
 
 @dataclass
 class QuantitativeMetrics:
@@ -117,10 +126,7 @@ class QuantitativeMetrics:
     cvd_divergence: str = "NONE"
 
     oi_change_pct: float = 0.0
-    oi_interpretation: str = "NEUTRAL"
-
     funding_rate: Optional[float] = None
-    funding_bias: str = "NEUTRAL"
 
     tenkan: float = 0.0
     kijun: float = 0.0
@@ -139,38 +145,33 @@ class ScoringBreakdown:
 
 
 @dataclass
+class SetupResult:
+    setup: SetupType
+    reason: str
+    direction: str
+    quality: float
+
+
+@dataclass
 class TradePlan:
     direction: str = "NONE"
-
-    entry_low: float = 0.0
-    entry_high: float = 0.0
-    entry_reference: float = 0.0
-
-    stop_loss: float = 0.0
-
-    tp1: float = 0.0
-    tp2: float = 0.0
-    tp3: float = 0.0
-
-    risk_per_unit: float = 0.0
-    rr_tp1: float = 0.0
-    rr_tp2: float = 0.0
-    rr_tp3: float = 0.0
-
-    capital: float = 0.0
-    risk_pct: float = 0.0
-    dollar_risk: float = 0.0
-
-    position_size: float = 0.0
-    position_notional: float = 0.0
-
-    trailing_activation: float = 0.0
-    trailing_distance: float = 0.0
+    entry_low: Optional[float] = None
+    entry_high: Optional[float] = None
+    stop_loss: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    rr_tp1: Optional[float] = None
+    rr_tp2: Optional[float] = None
+    rr_tp3: Optional[float] = None
+    position_size: Optional[float] = None
+    risk_amount: Optional[float] = None
+    invalidation: str = "No active trade plan"
 
 
-# ============================================================================
-# 3. MARKET DATA LOADER
-# ============================================================================
+# ============================================================
+# 3. DATA LOADER
+# ============================================================
 
 class MarketDataLoader:
 
@@ -190,103 +191,95 @@ class MarketDataLoader:
         limit: int = 500
     ) -> Tuple[Optional[pd.DataFrame], str]:
 
-        formatted_symbol = symbol.replace("/", "").upper()
+        symbol = symbol.replace("/", "").upper()
 
         headers = {
             "User-Agent": "Mozilla/5.0"
         }
 
-        binance_endpoints = [
-            f"https://api.binance.com/api/v3/klines"
-            f"?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+        endpoints = [
+            f"https://data-api.binance.vision/api/v3/klines"
+            f"?symbol={symbol}&interval={interval}&limit={limit}",
 
             f"https://api1.binance.com/api/v3/klines"
-            f"?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+            f"?symbol={symbol}&interval={interval}&limit={limit}",
+
+            f"https://api2.binance.com/api/v3/klines"
+            f"?symbol={symbol}&interval={interval}&limit={limit}",
 
             f"https://api3.binance.com/api/v3/klines"
-            f"?symbol={formatted_symbol}&interval={interval}&limit={limit}",
-
-            f"https://data-api.binance.vision/api/v3/klines"
-            f"?symbol={formatted_symbol}&interval={interval}&limit={limit}"
+            f"?symbol={symbol}&interval={interval}&limit={limit}",
         ]
 
-        for url in binance_endpoints:
-
+        for url in endpoints:
             try:
-
-                response = requests.get(
+                r = requests.get(
                     url,
                     headers=headers,
                     timeout=4
                 )
 
-                if response.status_code != 200:
-                    continue
+                if r.status_code == 200:
+                    data = r.json()
 
-                data = response.json()
+                    if isinstance(data, list) and data:
 
-                if not isinstance(data, list) or not data:
-                    continue
+                        df = pd.DataFrame(
+                            data,
+                            columns=[
+                                "timestamp",
+                                "open",
+                                "high",
+                                "low",
+                                "close",
+                                "volume",
+                                "close_time",
+                                "quote_av",
+                                "trades",
+                                "tb_base_av",
+                                "tb_quote_av",
+                                "ignore"
+                            ]
+                        )
 
-                df = pd.DataFrame(
-                    data,
-                    columns=[
-                        "timestamp",
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "volume",
-                        "close_time",
-                        "quote_av",
-                        "trades",
-                        "tb_base_av",
-                        "tb_quote_av",
-                        "ignore"
-                    ]
-                )
+                        for c in [
+                            "open",
+                            "high",
+                            "low",
+                            "close",
+                            "volume"
+                        ]:
+                            df[c] = pd.to_numeric(
+                                df[c],
+                                errors="coerce"
+                            )
 
-                for col in [
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume"
-                ]:
-                    df[col] = pd.to_numeric(
-                        df[col],
-                        errors="coerce"
-                    )
+                        df["timestamp"] = pd.to_datetime(
+                            df["timestamp"],
+                            unit="ms",
+                            utc=True
+                        ).dt.tz_localize(None)
 
-                df["timestamp"] = pd.to_datetime(
-                    df["timestamp"],
-                    unit="ms",
-                    utc=True
-                ).dt.tz_localize(None)
+                        return (
+                            df[
+                                [
+                                    "timestamp",
+                                    "open",
+                                    "high",
+                                    "low",
+                                    "close",
+                                    "volume"
+                                ]
+                            ],
+                            DataStatus.LIVE.value
+                        )
 
-                df = df[
-                    [
-                        "timestamp",
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                        "volume"
-                    ]
-                ]
+            except Exception:
+                continue
 
-                df = df.dropna().reset_index(drop=True)
-
-                return df, DataStatus.LIVE.value
-
-            except Exception as e:
-                logger.warning(
-                    f"Binance kline endpoint failed: {e}"
-                )
-
-        # --------------------------------------------------------------------
-        # Bybit fallback
-        # --------------------------------------------------------------------
+        # -----------------------------
+        # BYBIT FALLBACK
+        # -----------------------------
 
         try:
 
@@ -298,25 +291,23 @@ class MarketDataLoader:
             url = (
                 "https://api.bybit.com/v5/market/kline"
                 f"?category=spot"
-                f"&symbol={formatted_symbol}"
+                f"&symbol={symbol}"
                 f"&interval={bybit_tf}"
                 f"&limit={limit}"
             )
 
-            response = requests.get(
+            r = requests.get(
                 url,
                 headers=headers,
-                timeout=4
+                timeout=5
             )
 
-            if response.status_code == 200:
+            if r.status_code == 200:
 
-                data = response.json().get(
-                    "result",
-                    {}
-                ).get(
-                    "list",
-                    []
+                data = (
+                    r.json()
+                    .get("result", {})
+                    .get("list", [])
                 )
 
                 if data:
@@ -334,15 +325,15 @@ class MarketDataLoader:
                         ]
                     )
 
-                    for col in [
+                    for c in [
                         "open",
                         "high",
                         "low",
                         "close",
                         "volume"
                     ]:
-                        df[col] = pd.to_numeric(
-                            df[col],
+                        df[c] = pd.to_numeric(
+                            df[c],
                             errors="coerce"
                         )
 
@@ -353,8 +344,7 @@ class MarketDataLoader:
                     ).dt.tz_localize(None)
 
                     df = (
-                        df
-                        .iloc[::-1]
+                        df.iloc[::-1]
                         .reset_index(drop=True)
                     )
 
@@ -373,16 +363,18 @@ class MarketDataLoader:
                     )
 
         except Exception as e:
-
             logger.warning(
-                f"Bybit kline fetch failed: {e}"
+                f"Bybit spot error: {e}"
             )
 
-        return None, DataStatus.UNAVAILABLE.value
+        return (
+            None,
+            DataStatus.UNAVAILABLE.value
+        )
 
-    # =========================================================================
-    # FUTURES DATA
-    # =========================================================================
+    # --------------------------------------------------------
+    # FUTURES
+    # --------------------------------------------------------
 
     @staticmethod
     @st.cache_data(ttl=15)
@@ -390,195 +382,168 @@ class MarketDataLoader:
         symbol: str,
         interval: str,
         limit: int = 50
-    ) -> Tuple[
-        Optional[pd.DataFrame],
-        str,
-        Dict[str, Any]
-    ]:
+    ):
 
-        formatted_symbol = symbol.replace("/", "").upper()
+        symbol = symbol.replace("/", "").upper()
 
         headers = {
             "User-Agent": "Mozilla/5.0"
         }
 
-        funding_meta = {
+        funding = {
             "available": False,
             "current": None,
             "history": []
         }
 
-        # --------------------------------------------------------------------
         # Binance Futures
-        # --------------------------------------------------------------------
-
         try:
 
             oi_interval = (
                 interval
-                if interval in (
+                if interval in [
                     "5m",
                     "15m",
                     "1h",
                     "4h",
                     "1d"
-                )
+                ]
                 else "5m"
             )
 
             url_oi = (
                 "https://fapi.binance.com/futures/data/"
-                f"openInterestHist?symbol={formatted_symbol}"
-                f"&period={oi_interval}&limit={limit}"
+                f"openInterestHist?"
+                f"symbol={symbol}"
+                f"&period={oi_interval}"
+                f"&limit={limit}"
             )
 
             url_fr = (
                 "https://fapi.binance.com/fapi/v1/"
-                f"fundingRate?symbol={formatted_symbol}&limit=30"
+                f"fundingRate?symbol={symbol}&limit=30"
             )
 
-            res_oi = requests.get(
+            r_oi = requests.get(
                 url_oi,
                 headers=headers,
-                timeout=4
+                timeout=5
             )
 
-            res_fr = requests.get(
+            r_fr = requests.get(
                 url_fr,
                 headers=headers,
-                timeout=4
+                timeout=5
             )
 
-            if res_oi.status_code == 200:
+            if r_oi.status_code == 200:
 
-                oi_data = res_oi.json()
+                data = r_oi.json()
 
-                if isinstance(oi_data, list) and len(oi_data) >= 3:
+                if isinstance(data, list) and len(data) >= 2:
 
-                    df_oi = pd.DataFrame(
-                        oi_data
-                    )
+                    df = pd.DataFrame(data)
 
-                    df_oi["openInterest"] = pd.to_numeric(
-                        df_oi["sumOpenInterest"],
+                    df["openInterest"] = pd.to_numeric(
+                        df["sumOpenInterest"],
                         errors="coerce"
                     )
 
-                    df_oi["timestamp"] = pd.to_datetime(
-                        df_oi["timestamp"],
+                    df["timestamp"] = pd.to_datetime(
+                        df["timestamp"],
                         unit="ms",
                         utc=True
                     ).dt.tz_localize(None)
 
-                    df_oi = (
-                        df_oi
-                        .dropna(
+                    df = (
+                        df.dropna(
                             subset=["openInterest"]
                         )
                         .sort_values("timestamp")
                         .reset_index(drop=True)
                     )
 
-                    if res_fr.status_code == 200:
+                    if r_fr.status_code == 200:
 
-                        fr_data = res_fr.json()
+                        fr = r_fr.json()
 
-                        if (
-                            isinstance(fr_data, list)
-                            and fr_data
-                        ):
+                        if isinstance(fr, list) and fr:
 
                             hist = [
                                 float(
-                                    row.get(
+                                    x.get(
                                         "fundingRate",
-                                        0.0
+                                        0
                                     )
                                 )
-                                for row in reversed(fr_data)
-                                if "fundingRate" in row
+                                for x in reversed(fr)
                             ]
 
                             if hist:
 
-                                funding_meta[
-                                    "available"
-                                ] = True
-
-                                funding_meta[
-                                    "current"
-                                ] = hist[0]
-
-                                funding_meta[
-                                    "history"
-                                ] = hist
+                                funding["available"] = True
+                                funding["current"] = hist[0]
+                                funding["history"] = hist
 
                     return (
-                        df_oi,
+                        df,
                         DataStatus.LIVE.value,
-                        funding_meta
+                        funding
                     )
 
         except Exception as e:
 
             logger.warning(
-                f"Binance futures failed: {e}"
+                f"Binance futures error: {e}"
             )
 
-        # --------------------------------------------------------------------
-        # Bybit Futures
-        # --------------------------------------------------------------------
-
+        # Bybit fallback
         try:
 
-            bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(
+            tf = MarketDataLoader.BYBIT_TF_MAP.get(
                 interval,
                 "5"
             )
 
-            url_oi = (
+            url = (
                 "https://api.bybit.com/v5/market/open-interest"
                 f"?category=linear"
-                f"&symbol={formatted_symbol}"
-                f"&intervalTime={bybit_tf}"
+                f"&symbol={symbol}"
+                f"&intervalTime={tf}"
                 f"&limit={limit}"
             )
 
-            response = requests.get(
-                url_oi,
+            r = requests.get(
+                url,
                 headers=headers,
-                timeout=4
+                timeout=5
             )
 
-            if response.status_code == 200:
+            if r.status_code == 200:
 
                 data = (
-                    response
-                    .json()
+                    r.json()
                     .get("result", {})
                     .get("list", [])
                 )
 
                 if data:
 
-                    df_oi = pd.DataFrame(
-                        data
-                    )
+                    df = pd.DataFrame(data)
 
-                    df_oi["openInterest"] = pd.to_numeric(
-                        df_oi["openInterest"],
+                    df["openInterest"] = pd.to_numeric(
+                        df["openInterest"],
                         errors="coerce"
                     )
 
-                    df_oi["timestamp"] = pd.to_datetime(
-                        df_oi["timestamp"].astype(float),
+                    df["timestamp"] = pd.to_datetime(
+                        df["timestamp"].astype(float),
                         unit="ms",
                         utc=True
                     ).dt.tz_localize(None)
 
-                    df_oi = (
-                        df_oi
-                        .dropna(
+                    df = (
+                        df.dropna(
                             subset=["openInterest"]
                         )
                         .sort_values("timestamp")
@@ -586,117 +551,87 @@ class MarketDataLoader:
                     )
 
                     return (
-                        df_oi,
+                        df,
                         DataStatus.FALLBACK.value,
-                        funding_meta
+                        funding
                     )
 
         except Exception as e:
 
             logger.warning(
-                f"Bybit OI failed: {e}"
+                f"Bybit OI error: {e}"
             )
 
         return (
             None,
             DataStatus.UNAVAILABLE.value,
-            funding_meta
+            funding
         )
 
-    # =========================================================================
-    # RECENT TRADES
-    # =========================================================================
+    # --------------------------------------------------------
+    # TRADE TAPE
+    # --------------------------------------------------------
 
     @staticmethod
     @st.cache_data(ttl=10)
     def fetch_recent_trades(
         symbol: str,
         limit: int = 1000
-    ) -> Tuple[
-        Optional[pd.DataFrame],
-        str
-    ]:
+    ):
 
-        formatted_symbol = symbol.replace("/", "").upper()
-
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+        symbol = symbol.replace("/", "").upper()
 
         endpoints = [
-            f"https://api.binance.com/api/v3/trades"
-            f"?symbol={formatted_symbol}&limit={limit}",
-
-            f"https://api1.binance.com/api/v3/trades"
-            f"?symbol={formatted_symbol}&limit={limit}",
-
-            f"https://api3.binance.com/api/v3/trades"
-            f"?symbol={formatted_symbol}&limit={limit}",
 
             f"https://data-api.binance.vision/api/v3/trades"
-            f"?symbol={formatted_symbol}&limit={limit}"
+            f"?symbol={symbol}&limit={limit}",
+
+            f"https://api1.binance.com/api/v3/trades"
+            f"?symbol={symbol}&limit={limit}",
+
+            f"https://api3.binance.com/api/v3/trades"
+            f"?symbol={symbol}&limit={limit}"
         ]
 
         for url in endpoints:
 
             try:
 
-                response = requests.get(
+                r = requests.get(
                     url,
-                    headers=headers,
                     timeout=4
                 )
 
-                if response.status_code != 200:
-                    continue
+                if r.status_code == 200:
 
-                trades = response.json()
+                    data = r.json()
 
-                if (
-                    isinstance(trades, list)
-                    and trades
-                ):
+                    if data:
 
-                    df = pd.DataFrame(
-                        trades
-                    )
+                        df = pd.DataFrame(data)
 
-                    df["price"] = pd.to_numeric(
-                        df["price"],
-                        errors="coerce"
-                    )
-
-                    df["qty"] = pd.to_numeric(
-                        df["qty"],
-                        errors="coerce"
-                    )
-
-                    df["time"] = pd.to_datetime(
-                        df["time"],
-                        unit="ms",
-                        utc=True
-                    ).dt.tz_localize(None)
-
-                    df["is_buy"] = ~df[
-                        "isBuyerMaker"
-                    ]
-
-                    df = (
-                        df
-                        .dropna(
-                            subset=[
-                                "price",
-                                "qty"
-                            ]
+                        df["price"] = pd.to_numeric(
+                            df["price"],
+                            errors="coerce"
                         )
-                        .sort_values("time")
-                        .reset_index(drop=True)
-                    )
 
-                    if not df.empty:
+                        df["qty"] = pd.to_numeric(
+                            df["qty"],
+                            errors="coerce"
+                        )
+
+                        df["time"] = pd.to_datetime(
+                            df["time"],
+                            unit="ms",
+                            utc=True
+                        ).dt.tz_localize(None)
+
+                        df["is_buy"] = ~df["isBuyerMaker"]
 
                         return (
-                            df,
+                            df.dropna(
+                                subset=["price", "qty"]
+                            ).reset_index(drop=True),
                             DataStatus.LIVE.value
                         )
 
@@ -709,134 +644,102 @@ class MarketDataLoader:
         )
 
 
-# ============================================================================
+# ============================================================
 # 4. QUANTITATIVE ENGINE
-# ============================================================================
+# ============================================================
 
 class QuantitativeEngine:
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
     # ATR
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
 
     @staticmethod
-    def calculate_atr(
-        df: pd.DataFrame,
-        period: int = 14
-    ) -> pd.Series:
+    def atr(df, period=14):
 
-        high_low = (
-            df["high"] -
-            df["low"]
-        )
-
-        high_close = (
-            df["high"] -
-            df["close"].shift()
-        ).abs()
-
-        low_close = (
-            df["low"] -
-            df["close"].shift()
-        ).abs()
+        prev_close = df["close"].shift()
 
         tr = pd.concat(
             [
-                high_low,
-                high_close,
-                low_close
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs()
             ],
             axis=1
         ).max(axis=1)
 
-        atr = tr.rolling(
-            period,
-            min_periods=period
-        ).mean()
-
-        return atr.bfill()
-
-    # ------------------------------------------------------------------------
-    # Ichimoku
-    # ------------------------------------------------------------------------
-
-    @staticmethod
-    def calculate_ichimoku(
-        df: pd.DataFrame
-    ) -> pd.DataFrame:
-
-        df = df.copy()
-
-        df["tenkan"] = (
-            df["high"].rolling(9).max() +
-            df["low"].rolling(9).min()
-        ) / 2
-
-        df["kijun"] = (
-            df["high"].rolling(26).max() +
-            df["low"].rolling(26).min()
-        ) / 2
-
-        df["span_a"] = (
-            (
-                df["tenkan"] +
-                df["kijun"]
-            ) / 2
-        ).shift(26)
-
-        df["span_b"] = (
-            (
-                df["high"].rolling(52).max() +
-                df["low"].rolling(52).min()
-            ) / 2
-        ).shift(26)
-
-        return df
-
-    # ------------------------------------------------------------------------
-    # VWAP
-    # ------------------------------------------------------------------------
-
-    @staticmethod
-    def calculate_vwap(
-        df: pd.DataFrame,
-        anchor_type: str
-    ) -> pd.Series:
-
-        typical_price = (
-            df["high"] +
-            df["low"] +
-            df["close"]
-        ) / 3
-
-        pv = (
-            typical_price *
-            df["volume"]
+        return (
+            tr.rolling(period)
+            .mean()
+            .bfill()
         )
 
-        if anchor_type == "SESSION":
+    # --------------------------------------------------------
+    # ICHIMOKU
+    # --------------------------------------------------------
 
+    @staticmethod
+    def ichimoku(df):
+
+        d = df.copy()
+
+        d["tenkan"] = (
+            d["high"].rolling(9).max()
+            +
+            d["low"].rolling(9).min()
+        ) / 2
+
+        d["kijun"] = (
+            d["high"].rolling(26).max()
+            +
+            d["low"].rolling(26).min()
+        ) / 2
+
+        d["span_a"] = (
+            (d["tenkan"] + d["kijun"]) / 2
+        ).shift(26)
+
+        d["span_b"] = (
+            (
+                d["high"].rolling(52).max()
+                +
+                d["low"].rolling(52).min()
+            ) / 2
+        ).shift(26)
+
+        return d
+
+    # --------------------------------------------------------
+    # VWAP
+    # --------------------------------------------------------
+
+    @staticmethod
+    def vwap(df, mode):
+
+        typical = (
+            df["high"]
+            + df["low"]
+            + df["close"]
+        ) / 3
+
+        pv = typical * df["volume"]
+
+        if mode == "SESSION":
             group = df["timestamp"].dt.date
 
-        elif anchor_type == "WEEKLY":
-
+        elif mode == "WEEKLY":
             group = df["timestamp"].dt.to_period("W")
 
-        elif anchor_type == "MONTHLY":
-
+        elif mode == "MONTHLY":
             group = df["timestamp"].dt.to_period("M")
 
         else:
-
             group = pd.Series(
                 0,
                 index=df.index
             )
 
-        cumulative_pv = (
-            pv.groupby(group)
-            .cumsum()
-        )
+        cumulative_pv = pv.groupby(group).cumsum()
 
         cumulative_volume = (
             df["volume"]
@@ -852,259 +755,200 @@ class QuantitativeEngine:
             )
         )
 
-    # ------------------------------------------------------------------------
-    # Smart Anchor
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # SMART ANCHOR
+    # --------------------------------------------------------
 
     @staticmethod
-    def detect_smart_anchor(
-        df: pd.DataFrame
-    ) -> Tuple[int, str]:
+    def smart_anchor(df):
 
-        if len(df) < 50:
-
+        if len(df) < 30:
             return 0, "Initial"
 
-        sub = df.tail(100).copy()
+        d = df.tail(100).copy()
 
-        volume_std = (
-            sub["volume"].std() +
-            1e-9
+        z = (
+            d["volume"] - d["volume"].mean()
+        ) / (
+            d["volume"].std() + 1e-9
         )
 
-        sub["vol_z"] = (
-            sub["volume"] -
-            sub["volume"].mean()
-        ) / volume_std
-
-        idx = sub["vol_z"].idxmax()
+        idx = z.idxmax()
 
         return (
             int(idx),
-            f"Volume Spike "
-            f"(Z={sub.loc[idx, 'vol_z']:.1f})"
+            f"Volume Spike (Z={z.loc[idx]:.1f})"
         )
 
-    # ------------------------------------------------------------------------
-    # Anchored VWAP
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # ANCHORED VWAP
+    # --------------------------------------------------------
 
     @staticmethod
-    def calculate_anchored_vwap(
-        df: pd.DataFrame,
-        anchor_idx: int
-    ) -> pd.Series:
+    def anchored_vwap(df, anchor):
 
-        typical_price = (
-            df["high"] +
-            df["low"] +
-            df["close"]
+        typical = (
+            df["high"]
+            + df["low"]
+            + df["close"]
         ) / 3
 
-        pv = (
-            typical_price *
-            df["volume"]
-        )
+        pv = typical * df["volume"]
 
-        pv_anchored = pv.copy()
-        vol_anchored = df["volume"].copy()
+        pv = pv.copy()
+        vol = df["volume"].copy()
 
-        pv_anchored.iloc[:anchor_idx] = 0
-        vol_anchored.iloc[:anchor_idx] = 0
-
-        cumulative_pv = pv_anchored.cumsum()
-        cumulative_volume = vol_anchored.cumsum()
+        pv.iloc[:anchor] = 0
+        vol.iloc[:anchor] = 0
 
         avwap = (
-            cumulative_pv /
-            cumulative_volume.replace(
+            pv.cumsum() /
+            vol.cumsum().replace(
                 0,
                 np.nan
             )
         )
 
-        avwap.iloc[:anchor_idx] = np.nan
+        avwap.iloc[:anchor] = np.nan
 
         return avwap
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
     # CVD
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
 
     @staticmethod
-    def compute_cvd_metrics(
-        df_klines: pd.DataFrame,
-        df_trades: Optional[pd.DataFrame],
-        timeframe: str
-    ) -> Tuple[
-        pd.Series,
-        str,
-        float,
-        str
-    ]:
+    def cvd(
+        df,
+        trades,
+        timeframe
+    ):
 
-        df = df_klines.copy()
-
-        # --------------------------------------------------------------------
-        # Real trade tape
-        # --------------------------------------------------------------------
-
-        if (
-            df_trades is not None
-            and not df_trades.empty
-        ):
-
-            trades = df_trades.copy()
-
-            trades["signed_vol"] = np.where(
-                trades["is_buy"],
-                trades["qty"],
-                -trades["qty"]
-            )
-
-            # Determine candle frequency
-            freq_map = {
-                "5m": "5min",
-                "15m": "15min",
-                "1h": "1h",
-                "4h": "4h",
-                "1d": "1D"
-            }
-
-            freq = freq_map.get(
-                timeframe,
-                "5min"
-            )
-
-            # Create candle buckets
-            trade_delta = (
-                trades
-                .set_index("time")["signed_vol"]
-                .resample(freq)
-                .sum()
-            )
-
-            # Align to candle timestamps
-            delta = (
-                trade_delta
-                .reindex(
-                    df["timestamp"],
-                    fill_value=0
-                )
-            )
-
-            cvd = (
-                delta
-                .cumsum()
-                .reset_index(drop=True)
-            )
-
-            cvd_type = DataStatus.LIVE.value
-
-        # --------------------------------------------------------------------
-        # Approximate CVD
-        # --------------------------------------------------------------------
-
-        else:
+        if trades is None or trades.empty:
 
             candle_range = (
-                df["high"] -
-                df["low"]
-            ).replace(
-                0,
-                1e-9
-            )
+                df["high"] - df["low"]
+            ).replace(0, 1e-9)
 
-            delta_approx = (
-                df["volume"] *
+            delta = (
+                df["volume"]
+                *
                 (
-                    (
-                        df["close"] -
-                        df["open"]
-                    ) /
-                    candle_range
+                    (df["close"] - df["open"])
+                    / candle_range
                 )
             )
 
-            cvd = (
-                delta_approx
-                .cumsum()
+            cvd = delta.cumsum()
+
+            return (
+                cvd,
+                DataStatus.APPROXIMATED.value,
+                QuantitativeEngine.cvd_stats(
+                    df,
+                    cvd
+                )
             )
 
-            cvd_type = DataStatus.APPROXIMATED.value
+        t = trades.copy()
 
-        # --------------------------------------------------------------------
-        # CVD slope
-        # --------------------------------------------------------------------
+        t["signed"] = np.where(
+            t["is_buy"],
+            t["qty"],
+            -t["qty"]
+        )
 
-        if len(cvd) >= 10:
+        rule = {
+            "5m": "5min",
+            "15m": "15min",
+            "1h": "1h",
+            "4h": "4h",
+            "1d": "1D"
+        }.get(
+            timeframe,
+            "5min"
+        )
 
-            cvd_change = (
-                cvd.iloc[-1] -
-                cvd.iloc[-10]
+        delta = (
+            t.set_index("time")["signed"]
+            .resample(rule)
+            .sum()
+        )
+
+        cvd = delta.cumsum()
+
+        # Align to candle timestamps
+        cvd = (
+            cvd.reindex(
+                pd.DatetimeIndex(
+                    df["timestamp"]
+                ),
+                method="ffill"
             )
+            .fillna(0)
+        )
 
-            price_change = (
-                df["close"].iloc[-1] -
-                df["close"].iloc[-10]
+        return (
+            cvd.reset_index(drop=True),
+            DataStatus.LIVE.value,
+            QuantitativeEngine.cvd_stats(
+                df,
+                cvd.reset_index(drop=True)
             )
+        )
 
-        else:
+    @staticmethod
+    def cvd_stats(df, cvd):
 
-            cvd_change = 0
-            price_change = 0
+        if len(df) < 10:
+            return {
+                "slope": 0,
+                "divergence": "NONE"
+            }
 
-        if len(cvd) >= 5:
+        price_change = (
+            df["close"].iloc[-1]
+            -
+            df["close"].iloc[-10]
+        )
 
-            denominator = max(
-                abs(cvd.iloc[-5]),
-                1e-9
-            )
+        cvd_change = (
+            cvd.iloc[-1]
+            -
+            cvd.iloc[-10]
+        )
 
-            cvd_slope = (
-                cvd.iloc[-1] -
-                cvd.iloc[-5]
-            ) / denominator
-
-        else:
-
-            cvd_slope = 0.0
+        slope = (
+            cvd.iloc[-1]
+            -
+            cvd.iloc[-5]
+        ) / (
+            abs(cvd.iloc[-5])
+            + 1e-9
+        )
 
         divergence = "NONE"
 
-        if (
-            price_change < 0
-            and cvd_change > 0
-        ):
-
+        if price_change < 0 and cvd_change > 0:
             divergence = "BULLISH_ABSORPTION"
 
-        elif (
-            price_change > 0
-            and cvd_change < 0
-        ):
-
+        elif price_change > 0 and cvd_change < 0:
             divergence = "BEARISH_ABSORPTION"
 
-        return (
-            cvd,
-            cvd_type,
-            float(cvd_slope),
-            divergence
-        )
+        return {
+            "slope": float(slope),
+            "divergence": divergence
+        }
 
 
-# ============================================================================
+# ============================================================
 # 5. MARKET STATE ENGINE
-# ============================================================================
+# ============================================================
 
 class MarketStateEngine:
 
     @staticmethod
-    def classify_market_state(
-        df: pd.DataFrame,
-        atr: float
-    ) -> MarketState:
+    def classify(df, atr):
 
         close = df["close"].iloc[-1]
 
@@ -1123,41 +967,36 @@ class MarketStateEngine:
         )
 
         recent_range = (
-            df["high"].tail(10).max() -
+            df["high"].tail(10).max()
+            -
             df["low"].tail(10).min()
         )
 
         if recent_range > 3.5 * atr:
-
             return MarketState.VOLATILE_EXPANSION
 
         if recent_range < 1.5 * atr:
-
             return MarketState.RANGE_COMPRESSION
 
         if close > ema20 > ema50:
-
             return MarketState.TRENDING_BULL
 
         if close < ema20 < ema50:
-
             return MarketState.TRENDING_BEAR
 
         return MarketState.RANGE_COMPRESSION
 
 
-# ============================================================================
-# 6. MULTI TIMEFRAME ENGINE
-# ============================================================================
+# ============================================================
+# 6. MULTI-TIMEFRAME ENGINE
+# ============================================================
 
-class MultiTimeframeHierarchy:
+class MultiTimeframeEngine:
 
     @staticmethod
-    def evaluate_all(
-        symbol: str
-    ) -> Dict[str, Any]:
+    def evaluate(symbol):
 
-        timeframes = [
+        tfs = [
             "1d",
             "4h",
             "1h",
@@ -1165,25 +1004,21 @@ class MultiTimeframeHierarchy:
             "5m"
         ]
 
-        results = {}
+        result = {}
 
-        for tf in timeframes:
+        for tf in tfs:
 
             df, status = (
-                MarketDataLoader
-                .fetch_klines(
+                MarketDataLoader.fetch_klines(
                     symbol,
                     tf,
-                    150
+                    120
                 )
             )
 
-            if (
-                df is None
-                or df.empty
-            ):
+            if df is None or len(df) < 60:
 
-                results[tf] = {
+                result[tf] = {
                     "score": 50,
                     "bias": "NEUTRAL",
                     "status": status
@@ -1191,18 +1026,15 @@ class MultiTimeframeHierarchy:
 
                 continue
 
-            calc = (
-                QuantitativeEngine
-                .calculate_ichimoku(df)
-            )
+            d = QuantitativeEngine.ichimoku(df)
 
-            close = calc["close"].iloc[-1]
+            close = d["close"].iloc[-1]
 
-            tenkan = calc["tenkan"].iloc[-1]
-            kijun = calc["kijun"].iloc[-1]
+            tenkan = d["tenkan"].iloc[-1]
+            kijun = d["kijun"].iloc[-1]
 
-            span_a = calc["span_a"].iloc[-1]
-            span_b = calc["span_b"].iloc[-1]
+            span_a = d["span_a"].iloc[-1]
+            span_b = d["span_b"].iloc[-1]
 
             if pd.isna(span_a):
                 span_a = close
@@ -1224,333 +1056,573 @@ class MultiTimeframeHierarchy:
                 close > cloud_high
                 and tenkan > kijun
             ):
-
                 bias = "BULLISH"
-                score = 80.0
+                score = 80
 
             elif (
                 close < cloud_low
                 and tenkan < kijun
             ):
-
                 bias = "BEARISH"
-                score = 20.0
+                score = 20
 
             else:
 
-                bias = "NEUTRAL"
-                score = 50.0
+                if close > kijun:
+                    bias = "BULLISH"
+                    score = 60
 
-            results[tf] = {
+                elif close < kijun:
+                    bias = "BEARISH"
+                    score = 40
+
+                else:
+                    bias = "NEUTRAL"
+                    score = 50
+
+            result[tf] = {
                 "score": score,
                 "bias": bias,
-                "close": close,
                 "status": status
             }
 
-        context_score = (
-            results["1d"]["score"] * 0.60 +
-            results["4h"]["score"] * 0.40
+        context = (
+            result["1d"]["score"] * 0.60
+            +
+            result["4h"]["score"] * 0.40
         )
 
-        if context_score >= 65:
-
+        if context >= 65:
             context_bias = "BULLISH"
 
-        elif context_score <= 35:
-
+        elif context <= 35:
             context_bias = "BEARISH"
 
         else:
-
             context_bias = "NEUTRAL"
 
-        direction_bias = (
-            results["1h"]["bias"]
-        )
-
-        execution_score = (
-            results["15m"]["score"] * 0.50 +
-            results["5m"]["score"] * 0.50
+        execution = (
+            result["15m"]["score"] * 0.50
+            +
+            result["5m"]["score"] * 0.50
         )
 
         return {
-            "scores": {
-                tf: results[tf]["score"]
-                for tf in timeframes
-            },
-
-            "biases": {
-                tf: results[tf]["bias"]
-                for tf in timeframes
-            },
-
+            "frames": result,
+            "context_score": context,
             "context_bias": context_bias,
-
-            "direction_bias": direction_bias,
-
-            "exec_score": execution_score,
-
-            "raw": results
+            "direction_bias": result["1h"]["bias"],
+            "execution_score": execution
         }
 
 
-# ============================================================================
-# 7. FACTOR SCORING ENGINE
-# ============================================================================
+# ============================================================
+# 7. SETUP DETECTOR
+# ============================================================
+
+class SetupEngine:
+
+    @staticmethod
+    def detect(
+        df,
+        metrics,
+        market_state,
+        htf
+    ):
+
+        close = df["close"].iloc[-1]
+
+        prev_close = df["close"].iloc[-2]
+
+        vwap = metrics.vwap_session
+
+        atr = max(
+            metrics.atr_14,
+            close * 0.001
+        )
+
+        # ------------------------------------
+        # VWAP RECLAIM
+        # ------------------------------------
+
+        bullish_reclaim = (
+            prev_close < vwap
+            and close > vwap
+        )
+
+        bearish_reclaim = (
+            prev_close > vwap
+            and close < vwap
+        )
+
+        if bullish_reclaim:
+
+            return SetupResult(
+                SetupType.RECLAIM,
+                "Price reclaimed Session VWAP",
+                "LONG",
+                80
+            )
+
+        if bearish_reclaim:
+
+            return SetupResult(
+                SetupType.RECLAIM,
+                "Price lost Session VWAP",
+                "SHORT",
+                80
+            )
+
+        # ------------------------------------
+        # BREAKOUT
+        # ------------------------------------
+
+        resistance = (
+            df["high"]
+            .iloc[-21:-1]
+            .max()
+        )
+
+        support = (
+            df["low"]
+            .iloc[-21:-1]
+            .min()
+        )
+
+        volume_avg = (
+            df["volume"]
+            .iloc[-21:-1]
+            .mean()
+        )
+
+        volume_expansion = (
+            df["volume"].iloc[-1]
+            >
+            volume_avg * 1.5
+        )
+
+        if (
+            close > resistance
+            and volume_expansion
+        ):
+
+            return SetupResult(
+                SetupType.BREAKOUT,
+                "Resistance breakout with volume expansion",
+                "LONG",
+                85
+            )
+
+        if (
+            close < support
+            and volume_expansion
+        ):
+
+            return SetupResult(
+                SetupType.BREAKOUT,
+                "Support breakdown with volume expansion",
+                "SHORT",
+                85
+            )
+
+        # ------------------------------------
+        # REJECTION
+        # ------------------------------------
+
+        high = df["high"].iloc[-1]
+        low = df["low"].iloc[-1]
+        open_ = df["open"].iloc[-1]
+
+        upper_wick = high - max(
+            close,
+            open_
+        )
+
+        lower_wick = min(
+            close,
+            open_
+        ) - low
+
+        if (
+            upper_wick > atr * 0.7
+            and close < vwap
+        ):
+
+            return SetupResult(
+                SetupType.REJECTION,
+                "Upper rejection below VWAP",
+                "SHORT",
+                70
+            )
+
+        if (
+            lower_wick > atr * 0.7
+            and close > vwap
+        ):
+
+            return SetupResult(
+                SetupType.REJECTION,
+                "Lower rejection above VWAP",
+                "LONG",
+                70
+            )
+
+        # ------------------------------------
+        # MEAN REVERSION
+        # ------------------------------------
+
+        distance = (
+            close - vwap
+        ) / atr
+
+        if distance > 2.5:
+
+            return SetupResult(
+                SetupType.MEAN_REVERSION,
+                "Price excessively above VWAP",
+                "SHORT",
+                60
+            )
+
+        if distance < -2.5:
+
+            return SetupResult(
+                SetupType.MEAN_REVERSION,
+                "Price excessively below VWAP",
+                "LONG",
+                60
+            )
+
+        return SetupResult(
+            SetupType.NO_SETUP,
+            "No high-quality structural setup",
+            "NONE",
+            0
+        )
+
+
+# ============================================================
+# 8. TRIGGER ENGINE
+# ============================================================
+
+class TriggerEngine:
+
+    @staticmethod
+    def detect(
+        df,
+        metrics,
+        setup,
+        htf
+    ):
+
+        if setup.setup == SetupType.NO_SETUP:
+
+            return TriggerType.WAIT
+
+        close = df["close"].iloc[-1]
+
+        ema20 = (
+            df["close"]
+            .ewm(span=20)
+            .mean()
+            .iloc[-1]
+        )
+
+        bullish_flow = (
+            metrics.cvd_slope > 0
+            or
+            metrics.cvd_divergence
+            == "BULLISH_ABSORPTION"
+        )
+
+        bearish_flow = (
+            metrics.cvd_slope < 0
+            or
+            metrics.cvd_divergence
+            == "BEARISH_ABSORPTION"
+        )
+
+        if setup.direction == "LONG":
+
+            alignment = 0
+
+            if close > ema20:
+                alignment += 1
+
+            if bullish_flow:
+                alignment += 1
+
+            if htf["context_bias"] == "BULLISH":
+                alignment += 1
+
+            if htf["direction_bias"] == "BULLISH":
+                alignment += 1
+
+            if alignment >= 3:
+                return TriggerType.CONFIRMED_BUY
+
+            if (
+                metrics.cvd_divergence
+                == "BEARISH_ABSORPTION"
+            ):
+                return TriggerType.INVALID
+
+            return TriggerType.WAIT
+
+        if setup.direction == "SHORT":
+
+            alignment = 0
+
+            if close < ema20:
+                alignment += 1
+
+            if bearish_flow:
+                alignment += 1
+
+            if htf["context_bias"] == "BEARISH":
+                alignment += 1
+
+            if htf["direction_bias"] == "BEARISH":
+                alignment += 1
+
+            if alignment >= 3:
+                return TriggerType.CONFIRMED_SELL
+
+            if (
+                metrics.cvd_divergence
+                == "BULLISH_ABSORPTION"
+            ):
+                return TriggerType.INVALID
+
+            return TriggerType.WAIT
+
+        return TriggerType.WAIT
+
+
+# ============================================================
+# 9. FACTOR SCORING
+# ============================================================
 
 class FactorScoringEngine:
 
     @staticmethod
-    def compute_layered_score(
-        market_state: MarketState,
-        df: pd.DataFrame,
-        metrics: QuantitativeMetrics,
-        mft_res: Dict[str, Any],
-        data_status_futures: str,
-        data_status_cvd: str
-    ) -> ScoringBreakdown:
+    def score(
+        market_state,
+        df,
+        metrics,
+        htf,
+        futures_status,
+        cvd_status
+    ):
 
         close = df["close"].iloc[-1]
 
-        atr = (
-            metrics.atr_14
-            if metrics.atr_14 > 0
-            else 1.0
+        atr = max(
+            metrics.atr_14,
+            close * 0.001
         )
 
-        # ====================================================================
+        # ------------------------------------
         # DIRECTION
-        # ====================================================================
+        # ------------------------------------
 
-        direction_score = 0.0
+        direction = 0
 
-        if (
-            "BULLISH"
-            in mft_res["context_bias"]
-        ):
+        if htf["context_bias"] == "BULLISH":
+            direction += 15
 
-            direction_score += 15
+        elif htf["context_bias"] == "BEARISH":
+            direction -= 15
 
-        elif (
-            "BEARISH"
-            in mft_res["context_bias"]
-        ):
+        if htf["direction_bias"] == "BULLISH":
+            direction += 10
 
-            direction_score -= 15
+        elif htf["direction_bias"] == "BEARISH":
+            direction -= 10
 
-        if (
-            close > metrics.span_a
-            and close > metrics.span_b
-        ):
-
-            direction_score += 10
-
-        elif (
-            close < metrics.span_a
-            and close < metrics.span_b
-        ):
-
-            direction_score -= 10
-
-        # ====================================================================
+        # ------------------------------------
         # FLOW
-        # ====================================================================
+        # ------------------------------------
 
         if (
             metrics.cvd_divergence
             == "BULLISH_ABSORPTION"
         ):
-
-            flow_score = 25
+            flow = 20
 
         elif (
             metrics.cvd_divergence
             == "BEARISH_ABSORPTION"
         ):
-
-            flow_score = -25
+            flow = -20
 
         else:
 
-            flow_score = np.clip(
-                metrics.cvd_slope * 50,
-                -20,
-                20
+            flow = float(
+                np.clip(
+                    metrics.cvd_slope * 50,
+                    -20,
+                    20
+                )
             )
 
-        # ====================================================================
+        # ------------------------------------
         # POSITIONING
-        # ====================================================================
+        # ------------------------------------
 
-        positioning_score = 0.0
+        positioning = 0
 
         if (
-            data_status_futures
+            futures_status
             != DataStatus.UNAVAILABLE.value
         ):
 
-            if (
-                metrics.oi_change_pct > 2
-                and direction_score > 0
-            ):
+            if metrics.oi_change_pct > 2:
 
-                positioning_score += 15
+                if direction > 0:
+                    positioning += 15
 
-            elif (
-                metrics.oi_change_pct > 2
-                and direction_score < 0
-            ):
+                elif direction < 0:
+                    positioning -= 15
 
-                positioning_score -= 15
+            elif metrics.oi_change_pct < -2:
+
+                if direction > 0:
+                    positioning -= 8
+
+                elif direction < 0:
+                    positioning += 8
 
             if metrics.funding_rate is not None:
 
-                if (
-                    metrics.funding_rate
-                    < -0.0001
-                ):
+                if metrics.funding_rate < -0.0001:
+                    positioning += 8
 
-                    positioning_score += 10
+                elif metrics.funding_rate > 0.0003:
+                    positioning -= 8
 
-                elif (
-                    metrics.funding_rate
-                    > 0.0003
-                ):
-
-                    positioning_score -= 10
-
-        # ====================================================================
+        # ------------------------------------
         # LOCATION
-        # ====================================================================
+        # ------------------------------------
 
-        dist_vwap_atr = (
-            close -
-            metrics.vwap_session
+        distance = (
+            close - metrics.vwap_session
         ) / atr
 
-        if abs(dist_vwap_atr) <= 0.5:
+        if abs(distance) <= 0.5:
 
-            location_score = (
-                25
-                if direction_score >= 0
-                else -25
+            location = (
+                20
+                if direction >= 0
+                else -20
             )
 
-        elif dist_vwap_atr > 2:
+        elif distance > 2:
 
-            location_score = -15
+            location = -15
 
-        elif dist_vwap_atr < -2:
+        elif distance < -2:
 
-            location_score = 15
+            location = 15
 
         else:
 
-            location_score = (
-                10
-                if dist_vwap_atr > 0
-                else -10
+            location = (
+                8
+                if distance > 0
+                else -8
             )
 
-        # ====================================================================
-        # DYNAMIC WEIGHTS
-        # ====================================================================
+        # ------------------------------------
+        # WEIGHTS
+        # ------------------------------------
 
-        if (
-            market_state
-            == MarketState.RANGE_COMPRESSION
-        ):
+        if market_state == MarketState.RANGE_COMPRESSION:
 
-            dir_weight = 0.15
-            flow_weight = 0.30
-            positioning_weight = 0.15
-            location_weight = 0.40
+            dw, fw, pw, lw = (
+                0.15,
+                0.30,
+                0.15,
+                0.40
+            )
 
-        elif market_state in (
+        elif market_state in [
             MarketState.TRENDING_BULL,
             MarketState.TRENDING_BEAR
-        ):
+        ]:
 
-            dir_weight = 0.35
-            flow_weight = 0.25
-            positioning_weight = 0.20
-            location_weight = 0.20
+            dw, fw, pw, lw = (
+                0.35,
+                0.25,
+                0.20,
+                0.20
+            )
 
         else:
 
-            dir_weight = 0.25
-            flow_weight = 0.25
-            positioning_weight = 0.25
-            location_weight = 0.25
+            dw = fw = pw = lw = 0.25
 
         total = (
-            direction_score * dir_weight +
-            flow_score * flow_weight +
-            positioning_score * positioning_weight +
-            location_score * location_weight
+            direction * dw
+            +
+            flow * fw
+            +
+            positioning * pw
+            +
+            location * lw
         )
 
-        # ====================================================================
+        # ------------------------------------
         # DATA QUALITY
-        # ====================================================================
+        # ------------------------------------
 
-        quality = 100.0
+        quality = 100
 
         if (
-            data_status_futures
+            futures_status
             == DataStatus.UNAVAILABLE.value
         ):
-
-            quality -= 30
+            quality -= 25
 
         elif (
-            data_status_futures
+            futures_status
             == DataStatus.FALLBACK.value
         ):
-
             quality -= 10
 
         if (
-            data_status_cvd
+            cvd_status
             == DataStatus.APPROXIMATED.value
         ):
-
-            quality -= 18
+            quality -= 15
 
         elif (
-            data_status_cvd
+            cvd_status
             == DataStatus.UNAVAILABLE.value
         ):
-
-            quality -= 30
+            quality -= 25
 
         return ScoringBreakdown(
             direction_score=round(
-                direction_score,
+                direction,
                 1
             ),
-
             flow_score=round(
-                flow_score,
+                flow,
                 1
             ),
-
             positioning_score=round(
-                positioning_score,
+                positioning,
                 1
             ),
-
             location_score=round(
-                location_score,
+                location,
                 1
             ),
-
             total_score=round(
                 total,
                 1
             ),
-
             data_quality_pct=max(
                 0,
                 quality
@@ -1558,635 +1630,190 @@ class FactorScoringEngine:
         )
 
 
-# ============================================================================
-# 8. SETUP DETECTION ENGINE
-# ============================================================================
-
-class SetupEngine:
-
-    @staticmethod
-    def detect_setup(
-        df: pd.DataFrame,
-        metrics: QuantitativeMetrics,
-        market_state: MarketState
-    ) -> Tuple[
-        SetupType,
-        str
-    ]:
-
-        if len(df) < 20:
-
-            return (
-                SetupType.NO_SETUP,
-                "Insufficient data"
-            )
-
-        close = df["close"].iloc[-1]
-
-        previous_close = (
-            df["close"].iloc[-2]
-        )
-
-        high_20 = (
-            df["high"]
-            .tail(20)
-            .max()
-        )
-
-        low_20 = (
-            df["low"]
-            .tail(20)
-            .min()
-        )
-
-        atr = max(
-            metrics.atr_14,
-            1e-9
-        )
-
-        # ====================================================================
-        # BREAKOUT
-        # ====================================================================
-
-        if (
-            close > high_20
-            and (
-                close -
-                previous_close
-            ) > 0.5 * atr
-        ):
-
-            return (
-                SetupType.BREAKOUT,
-                "Price expansion above recent structure"
-            )
-
-        if (
-            close < low_20
-            and (
-                previous_close -
-                close
-            ) > 0.5 * atr
-        ):
-
-            return (
-                SetupType.BREAKOUT,
-                "Price expansion below recent structure"
-            )
-
-        # ====================================================================
-        # VWAP RECLAIM
-        # ====================================================================
-
-        if (
-            previous_close
-            < metrics.vwap_session
-            and close
-            > metrics.vwap_session
-        ):
-
-            return (
-                SetupType.RECLAIM,
-                "Price reclaimed Session VWAP"
-            )
-
-        if (
-            previous_close
-            > metrics.vwap_session
-            and close
-            < metrics.vwap_session
-        ):
-
-            return (
-                SetupType.RECLAIM,
-                "Price lost Session VWAP"
-            )
-
-        # ====================================================================
-        # REJECTION
-        # ====================================================================
-
-        candle = df.iloc[-1]
-
-        upper_wick = (
-            candle["high"] -
-            max(
-                candle["open"],
-                candle["close"]
-            )
-        )
-
-        lower_wick = (
-            min(
-                candle["open"],
-                candle["close"]
-            ) -
-            candle["low"]
-        )
-
-        if (
-            close < metrics.vwap_session
-            and upper_wick > 0.5 * atr
-        ):
-
-            return (
-                SetupType.REJECTION,
-                "Upper rejection near value"
-            )
-
-        if (
-            close > metrics.vwap_session
-            and lower_wick > 0.5 * atr
-        ):
-
-            return (
-                SetupType.REJECTION,
-                "Lower rejection near value"
-            )
-
-        # ====================================================================
-        # MEAN REVERSION
-        # ====================================================================
-
-        distance = (
-            close -
-            metrics.vwap_session
-        ) / atr
-
-        if abs(distance) >= 2.5:
-
-            return (
-                SetupType.MEAN_REVERSION,
-                "Price is materially extended from VWAP"
-            )
-
-        return (
-            SetupType.NO_SETUP,
-            "No high-quality structural setup"
-        )
-
-
-# ============================================================================
-# 9. TRIGGER ENGINE
-# ============================================================================
-
-class TriggerEngine:
-
-    @staticmethod
-    def evaluate_trigger(
-        setup: SetupType,
-        score: ScoringBreakdown,
-        mft: Dict[str, Any],
-        metrics: QuantitativeMetrics
-    ) -> TriggerType:
-
-        if setup == SetupType.NO_SETUP:
-
-            return TriggerType.WAIT
-
-        score_value = score.total_score
-
-        context = mft["context_bias"]
-
-        execution = mft["exec_score"]
-
-        # ====================================================================
-        # LONG
-        # ====================================================================
-
-        long_alignment = (
-            score_value >= 12
-            and context == "BULLISH"
-            and execution >= 55
-        )
-
-        # ====================================================================
-        # SHORT
-        # ====================================================================
-
-        short_alignment = (
-            score_value <= -12
-            and context == "BEARISH"
-            and execution <= 45
-        )
-
-        if (
-            long_alignment
-            and setup in (
-                SetupType.RECLAIM,
-                SetupType.BREAKOUT
-            )
-        ):
-
-            return TriggerType.CONFIRMED_BUY
-
-        if (
-            short_alignment
-            and setup in (
-                SetupType.RECLAIM,
-                SetupType.BREAKOUT
-            )
-        ):
-
-            return TriggerType.CONFIRMED_SELL
-
-        # Absorption can act as reversal confirmation
-
-        if (
-            metrics.cvd_divergence
-            == "BULLISH_ABSORPTION"
-            and score_value >= 10
-            and context != "BEARISH"
-        ):
-
-            return TriggerType.CONFIRMED_BUY
-
-        if (
-            metrics.cvd_divergence
-            == "BEARISH_ABSORPTION"
-            and score_value <= -10
-            and context != "BULLISH"
-        ):
-
-            return TriggerType.CONFIRMED_SELL
-
-        return TriggerType.WAIT
-
-
-# ============================================================================
+# ============================================================
 # 10. SIGNAL GRADING
-# ============================================================================
+# ============================================================
 
-class SignalGradingEngine:
+class SignalEngine:
 
     @staticmethod
-    def grade_signal(
-        score: ScoringBreakdown,
-        trigger: TriggerType,
-        setup: SetupType
-    ) -> SignalGrade:
-
-        strength = abs(
-            score.total_score
-        )
-
-        quality = (
-            score.data_quality_pct
-        )
+    def grade(
+        score,
+        setup,
+        trigger,
+        quality,
+        htf
+    ):
 
         if (
             trigger
-            in (
+            == TriggerType.INVALID
+        ):
+            return SignalGrade.NO_TRADE
+
+        if (
+            setup.setup
+            == SetupType.NO_SETUP
+        ):
+            return SignalGrade.NEUTRAL
+
+        if quality < 60:
+            return SignalGrade.NO_TRADE
+
+        abs_score = abs(score)
+
+        if (
+            abs_score >= 30
+            and quality >= 85
+            and trigger in [
                 TriggerType.CONFIRMED_BUY,
                 TriggerType.CONFIRMED_SELL
-            )
-            and strength >= 18
-            and quality >= 85
+            ]
         ):
-
             return SignalGrade.INSTITUTIONAL_STRONG
 
         if (
-            trigger
-            in (
+            abs_score >= 22
+            and trigger in [
                 TriggerType.CONFIRMED_BUY,
                 TriggerType.CONFIRMED_SELL
-            )
-            and strength >= 14
-            and quality >= 70
+            ]
         ):
-
             return SignalGrade.CONFIRMED
 
-        if (
-            strength >= 10
-            and setup != SetupType.NO_SETUP
-        ):
-
+        if abs_score >= 15:
             return SignalGrade.MODERATE
 
-        if strength >= 5:
-
-            return SignalGrade.NEUTRAL
-
-        return SignalGrade.NO_TRADE
+        return SignalGrade.NEUTRAL
 
 
-# ============================================================================
-# 11. TRADE MANAGEMENT ENGINE
-# ============================================================================
+# ============================================================
+# 11. TRADE MANAGEMENT
+# ============================================================
 
-class TradeManagementEngine:
+class TradeManagement:
 
     @staticmethod
-    def build_trade_plan(
-        direction: str,
-        df: pd.DataFrame,
-        metrics: QuantitativeMetrics,
-        capital: float,
-        risk_pct: float
-    ) -> TradePlan:
+    def build(
+        df,
+        metrics,
+        direction,
+        capital,
+        risk_pct
+    ):
 
-        close = float(
-            df["close"].iloc[-1]
-        )
+        if direction not in [
+            "LONG",
+            "SHORT"
+        ]:
+            return TradePlan()
+
+        price = df["close"].iloc[-1]
 
         atr = max(
-            float(metrics.atr_14),
-            close * 0.005
+            metrics.atr_14,
+            price * 0.001
         )
 
-        # --------------------------------------------------------------------
-        # Entry
-        # --------------------------------------------------------------------
-
-        vwap_values = [
-            metrics.vwap_session,
-            metrics.vwap_weekly
-        ]
-
-        if metrics.vwap_anchored is not None:
-
-            vwap_values.append(
-                metrics.vwap_anchored
-            )
-
-        vwap_values = [
-            x for x in vwap_values
-            if x is not None
-            and np.isfinite(x)
-            and x > 0
-        ]
-
-        if vwap_values:
-
-            entry_reference = float(
-                np.mean(vwap_values)
-            )
-
-        else:
-
-            entry_reference = close
-
-        # Do not allow reference to be too far away
-        max_entry_distance = 0.75 * atr
-
-        entry_reference = np.clip(
-            entry_reference,
-            close - max_entry_distance,
-            close + max_entry_distance
-        )
-
-        entry_low = (
-            min(
-                close,
-                entry_reference
-            ) -
-            0.10 * atr
-        )
-
-        entry_high = (
-            max(
-                close,
-                entry_reference
-            ) +
-            0.10 * atr
-        )
-
-        # --------------------------------------------------------------------
-        # Stop / targets
-        # --------------------------------------------------------------------
-
-        if direction == "LONG":
-
-            stop_loss = (
-                entry_reference -
-                1.25 * atr
-            )
-
-            risk_per_unit = (
-                entry_reference -
-                stop_loss
-            )
-
-            tp1 = (
-                entry_reference +
-                1.0 * risk_per_unit
-            )
-
-            tp2 = (
-                entry_reference +
-                2.0 * risk_per_unit
-            )
-
-            tp3 = (
-                entry_reference +
-                3.0 * risk_per_unit
-            )
-
-        elif direction == "SHORT":
-
-            stop_loss = (
-                entry_reference +
-                1.25 * atr
-            )
-
-            risk_per_unit = (
-                stop_loss -
-                entry_reference
-            )
-
-            tp1 = (
-                entry_reference -
-                1.0 * risk_per_unit
-            )
-
-            tp2 = (
-                entry_reference -
-                2.0 * risk_per_unit
-            )
-
-            tp3 = (
-                entry_reference -
-                3.0 * risk_per_unit
-            )
-
-        else:
-
-            return TradePlan(
-                direction="NONE",
-                capital=capital,
-                risk_pct=risk_pct
-            )
-
-        # --------------------------------------------------------------------
-        # Risk
-        # --------------------------------------------------------------------
-
-        dollar_risk = (
-            capital *
-            risk_pct /
+        risk_amount = (
+            capital
+            *
+            risk_pct
+            /
             100
         )
 
-        position_size = (
-            dollar_risk /
-            max(risk_per_unit, 1e-9)
-        )
+        # Entry zone around current market
+        entry_low = price - atr * 0.15
+        entry_high = price + atr * 0.15
 
-        position_notional = (
-            position_size *
-            entry_reference
-        )
+        if direction == "LONG":
 
-        # --------------------------------------------------------------------
-        # R:R
-        # --------------------------------------------------------------------
-
-        rr_tp1 = (
-            abs(tp1 - entry_reference) /
-            max(risk_per_unit, 1e-9)
-        )
-
-        rr_tp2 = (
-            abs(tp2 - entry_reference) /
-            max(risk_per_unit, 1e-9)
-        )
-
-        rr_tp3 = (
-            abs(tp3 - entry_reference) /
-            max(risk_per_unit, 1e-9)
-        )
-
-        # --------------------------------------------------------------------
-        # Trailing
-        # --------------------------------------------------------------------
-
-        trailing_activation = (
-            tp1
-        )
-
-        trailing_distance = (
-            0.75 * atr
-        )
-
-        return TradePlan(
-            direction=direction,
-
-            entry_low=float(
+            entry = (
                 entry_low
-            ),
-
-            entry_high=float(
+                +
                 entry_high
-            ),
+            ) / 2
 
-            entry_reference=float(
-                entry_reference
-            ),
+            stop = entry - atr * 1.5
 
-            stop_loss=float(
-                stop_loss
-            ),
+            risk_per_unit = (
+                entry - stop
+            )
 
-            tp1=float(tp1),
-            tp2=float(tp2),
-            tp3=float(tp3),
+            tp1 = entry + atr * 1.5
+            tp2 = entry + atr * 2.5
+            tp3 = entry + atr * 4.0
 
-            risk_per_unit=float(
-                risk_per_unit
-            ),
+            invalidation = (
+                f"LONG invalid if price closes "
+                f"below ${stop:,.4f}"
+            )
 
-            rr_tp1=float(rr_tp1),
-            rr_tp2=float(rr_tp2),
-            rr_tp3=float(rr_tp3),
+        else:
 
-            capital=float(capital),
-            risk_pct=float(risk_pct),
-            dollar_risk=float(
-                dollar_risk
-            ),
+            entry = (
+                entry_low
+                +
+                entry_high
+            ) / 2
 
-            position_size=float(
-                position_size
-            ),
+            stop = entry + atr * 1.5
 
-            position_notional=float(
-                position_notional
-            ),
+            risk_per_unit = (
+                stop - entry
+            )
 
-            trailing_activation=float(
-                trailing_activation
-            ),
+            tp1 = entry - atr * 1.5
+            tp2 = entry - atr * 2.5
+            tp3 = entry - atr * 4.0
 
-            trailing_distance=float(
-                trailing_distance
+            invalidation = (
+                f"SHORT invalid if price closes "
+                f"above ${stop:,.4f}"
+            )
+
+        position_size = (
+            risk_amount
+            /
+            max(
+                risk_per_unit,
+                1e-9
             )
         )
 
+        def rr(target):
 
-# ============================================================================
-# 12. TRADE MANAGEMENT STATUS
-# ============================================================================
+            if direction == "LONG":
 
-class TradeStateEngine:
+                return (
+                    target - entry
+                ) / risk_per_unit
 
-    @staticmethod
-    def evaluate_position(
-        current_price: float,
-        plan: TradePlan
-    ) -> str:
+            return (
+                entry - target
+            ) / risk_per_unit
 
-        if plan.direction == "NONE":
-
-            return "NO ACTIVE PLAN"
-
-        if plan.direction == "LONG":
-
-            if current_price <= plan.stop_loss:
-
-                return "STOP LOSS ZONE"
-
-            if current_price >= plan.tp3:
-
-                return "TP3 REACHED"
-
-            if current_price >= plan.tp2:
-
-                return "TP2 REACHED / TRAIL"
-
-            if current_price >= plan.tp1:
-
-                return "TP1 REACHED / MOVE SL"
-
-            return "POSITION ACTIVE"
-
-        if plan.direction == "SHORT":
-
-            if current_price >= plan.stop_loss:
-
-                return "STOP LOSS ZONE"
-
-            if current_price <= plan.tp3:
-
-                return "TP3 REACHED"
-
-            if current_price <= plan.tp2:
-
-                return "TP2 REACHED / TRAIL"
-
-            if current_price <= plan.tp1:
-
-                return "TP1 REACHED / MOVE SL"
-
-            return "POSITION ACTIVE"
-
-        return "NO ACTIVE PLAN"
+        return TradePlan(
+            direction=direction,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            stop_loss=stop,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            rr_tp1=rr(tp1),
+            rr_tp2=rr(tp2),
+            rr_tp3=rr(tp3),
+            position_size=position_size,
+            risk_amount=risk_amount,
+            invalidation=invalidation
+        )
 
 
-# ============================================================================
-# 13. UI CSS
-# ============================================================================
+# ============================================================
+# 12. CSS
+# ============================================================
 
 def render_css():
 
@@ -2202,38 +1829,33 @@ def render_css():
             white-space: normal !important;
         }
 
-        .status-badge-green {
-            background-color: #133E2B;
+        .status {
+            padding: 4px 8px;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+
+        .green {
+            background: #133E2B;
             color: #00E676;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 12px;
         }
 
-        .status-badge-red {
-            background-color: #4A191B;
+        .red {
+            background: #4A191B;
             color: #FF5252;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 12px;
         }
 
-        .status-badge-yellow {
-            background-color: #3D3214;
+        .yellow {
+            background: #3D3214;
             color: #FFD600;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 12px;
         }
 
-        .trade-card {
-            background-color: #1E222D;
-            border: 1px solid #2A2E39;
+        .decision {
+            background: #1E222D;
+            padding: 18px;
             border-radius: 8px;
-            padding: 15px;
+            border-left: 5px solid;
         }
 
         </style>
@@ -2242,24 +1864,24 @@ def render_css():
     )
 
 
-# ============================================================================
-# 14. MAIN
-# ============================================================================
+# ============================================================
+# 13. MAIN
+# ============================================================
 
 def main():
 
     render_css()
 
-    # ========================================================================
+    # ========================================================
     # SIDEBAR
-    # ========================================================================
+    # ========================================================
 
     with st.sidebar:
 
         st.title("⚡ AliQuantFund")
 
         st.caption(
-            "Institutional Engine v4.3"
+            "Institutional Master Engine v4.3"
         )
 
         st.markdown("---")
@@ -2272,8 +1894,7 @@ def main():
                 "ZEC/USDT",
                 "SOL/USDT",
                 "XRP/USDT"
-            ],
-            index=0
+            ]
         )
 
         timeframe = st.selectbox(
@@ -2290,7 +1911,7 @@ def main():
         st.markdown("---")
 
         capital = st.number_input(
-            "رأس المال ($)",
+            "Capital ($)",
             min_value=10.0,
             value=100.0,
             step=10.0
@@ -2300,585 +1921,425 @@ def main():
             "Risk per Trade (%)",
             min_value=0.1,
             max_value=10.0,
-            value=1.0,
+            value=2.0,
             step=0.5
         )
-
-        st.markdown("---")
 
         auto_refresh = st.checkbox(
             "Auto Refresh",
             value=True
         )
 
-        if auto_refresh:
+        st.markdown("---")
 
-            st.caption(
-                "البيانات يتم تحديثها تلقائياً حسب Cache TTL."
-            )
+        st.info(
+            "النظام لا ينفذ الصفقات. "
+            "هو محرك تحليل وإشارات وإدارة صفقة."
+        )
 
-    # ========================================================================
+    # ========================================================
     # DATA
-    # ========================================================================
+    # ========================================================
 
     with st.spinner(
         f"جاري تحليل {symbol}..."
     ):
 
         df, spot_status = (
-            MarketDataLoader
-            .fetch_klines(
+            MarketDataLoader.fetch_klines(
                 symbol,
                 timeframe,
                 500
             )
         )
 
-        df_futures, futures_status, funding_meta = (
-            MarketDataLoader
-            .fetch_futures_metrics(
+        futures, futures_status, funding = (
+            MarketDataLoader.fetch_futures_metrics(
                 symbol,
-                timeframe
+                timeframe,
+                50
             )
         )
 
-        df_trades, trades_status = (
-            MarketDataLoader
-            .fetch_recent_trades(
+        trades, cvd_status = (
+            MarketDataLoader.fetch_recent_trades(
                 symbol
             )
         )
 
-    if (
-        df is None
-        or df.empty
-    ):
+    if df is None or df.empty:
 
         st.error(
-            "❌ تعذر جلب بيانات السوق."
+            "❌ تعذر الحصول على بيانات السوق."
         )
 
         return
 
-    # ========================================================================
+    # ========================================================
     # INDICATORS
-    # ========================================================================
+    # ========================================================
 
-    df_calc = (
-        QuantitativeEngine
-        .calculate_ichimoku(df)
+    df = QuantitativeEngine.ichimoku(df)
+
+    atr_series = (
+        QuantitativeEngine.atr(df)
     )
 
-    atr = (
-        QuantitativeEngine
-        .calculate_atr(df_calc)
-        .iloc[-1]
-    )
+    atr = atr_series.iloc[-1]
 
-    vwap_session_series = (
-        QuantitativeEngine
-        .calculate_vwap(
-            df_calc,
+    vwap_session = (
+        QuantitativeEngine.vwap(
+            df,
             "SESSION"
         )
     )
 
-    vwap_weekly_series = (
-        QuantitativeEngine
-        .calculate_vwap(
-            df_calc,
+    vwap_weekly = (
+        QuantitativeEngine.vwap(
+            df,
             "WEEKLY"
         )
     )
 
-    vwap_monthly_series = (
-        QuantitativeEngine
-        .calculate_vwap(
-            df_calc,
+    vwap_monthly = (
+        QuantitativeEngine.vwap(
+            df,
             "MONTHLY"
         )
     )
 
     anchor_idx, anchor_reason = (
-        QuantitativeEngine
-        .detect_smart_anchor(
-            df_calc
-        )
+        QuantitativeEngine.smart_anchor(df)
     )
 
-    avwap_series = (
-        QuantitativeEngine
-        .calculate_anchored_vwap(
-            df_calc,
+    avwap = (
+        QuantitativeEngine.anchored_vwap(
+            df,
             anchor_idx
         )
     )
 
-    cvd_series, cvd_type, cvd_slope, cvd_div = (
-        QuantitativeEngine
-        .compute_cvd_metrics(
-            df_calc,
-            df_trades,
+    cvd_series, cvd_type, cvd_stats = (
+        QuantitativeEngine.cvd(
+            df,
+            trades,
             timeframe
         )
     )
 
-    # ========================================================================
+    # ========================================================
     # OI
-    # ========================================================================
+    # ========================================================
 
-    oi_change_pct = 0.0
+    oi_change = 0.0
 
     if (
-        df_futures is not None
-        and not df_futures.empty
-        and len(df_futures) >= 2
+        futures is not None
+        and len(futures) >= 2
     ):
 
-        oi_start = (
-            df_futures[
-                "openInterest"
-            ].iloc[0]
-        )
+        start = futures[
+            "openInterest"
+        ].iloc[0]
 
-        oi_end = (
-            df_futures[
-                "openInterest"
-            ].iloc[-1]
-        )
+        end = futures[
+            "openInterest"
+        ].iloc[-1]
 
-        oi_change_pct = (
-            (
-                oi_end -
-                oi_start
-            ) /
-            max(
-                abs(oi_start),
-                1e-9
+        if start != 0:
+
+            oi_change = (
+                (end - start)
+                /
+                start
+                *
+                100
             )
-        ) * 100
 
-    # ========================================================================
-    # FUNDING INTERPRETATION
-    # ========================================================================
-
-    funding_rate = (
-        funding_meta.get(
-            "current"
-        )
-    )
-
-    if funding_rate is None:
-
-        funding_bias = "NEUTRAL"
-
-    elif funding_rate > 0.0003:
-
-        funding_bias = "LONG_OVERHEATED"
-
-    elif funding_rate < -0.0001:
-
-        funding_bias = "SHORT_HEAVY"
-
-    else:
-
-        funding_bias = "NEUTRAL"
-
-    # ========================================================================
-    # OI INTERPRETATION
-    # ========================================================================
-
-    if oi_change_pct > 2:
-
-        oi_interpretation = "RISING_OI"
-
-    elif oi_change_pct < -2:
-
-        oi_interpretation = "FALLING_OI"
-
-    else:
-
-        oi_interpretation = "STABLE_OI"
-
-    # ========================================================================
+    # ========================================================
     # METRICS
-    # ========================================================================
+    # ========================================================
+
+    def safe_last(series, fallback):
+
+        value = series.iloc[-1]
+
+        if pd.isna(value):
+            return fallback
+
+        return float(value)
+
+    close = float(
+        df["close"].iloc[-1]
+    )
 
     metrics = QuantitativeMetrics(
 
-        vwap_session=float(
-            vwap_session_series.iloc[-1]
+        vwap_session=safe_last(
+            vwap_session,
+            close
         ),
 
-        vwap_weekly=float(
-            vwap_weekly_series.iloc[-1]
+        vwap_weekly=safe_last(
+            vwap_weekly,
+            close
         ),
 
-        vwap_monthly=float(
-            vwap_monthly_series.iloc[-1]
+        vwap_monthly=safe_last(
+            vwap_monthly,
+            close
         ),
 
         vwap_anchored=(
-            float(
-                avwap_series.iloc[-1]
+            safe_last(
+                avwap,
+                close
             )
-            if pd.notna(
-                avwap_series.iloc[-1]
-            )
+            if not avwap.isna().all()
             else None
         ),
 
         atr_14=float(atr),
 
-        cvd_slope=float(
-            cvd_slope
+        cvd_slope=cvd_stats["slope"],
+
+        cvd_divergence=cvd_stats[
+            "divergence"
+        ],
+
+        oi_change_pct=oi_change,
+
+        funding_rate=funding.get(
+            "current"
         ),
 
-        cvd_divergence=cvd_div,
-
-        oi_change_pct=float(
-            oi_change_pct
+        tenkan=safe_last(
+            df["tenkan"],
+            close
         ),
 
-        oi_interpretation=(
-            oi_interpretation
+        kijun=safe_last(
+            df["kijun"],
+            close
         ),
 
-        funding_rate=funding_rate,
-
-        funding_bias=funding_bias,
-
-        tenkan=float(
-            df_calc[
-                "tenkan"
-            ].iloc[-1]
+        span_a=safe_last(
+            df["span_a"],
+            close
         ),
 
-        kijun=float(
-            df_calc[
-                "kijun"
-            ].iloc[-1]
-        ),
-
-        span_a=float(
-            df_calc[
-                "span_a"
-            ].iloc[-1]
-            if pd.notna(
-                df_calc[
-                    "span_a"
-                ].iloc[-1]
-            )
-            else df_calc[
-                "close"
-            ].iloc[-1]
-        ),
-
-        span_b=float(
-            df_calc[
-                "span_b"
-            ].iloc[-1]
-            if pd.notna(
-                df_calc[
-                    "span_b"
-                ].iloc[-1]
-            )
-            else df_calc[
-                "close"
-            ].iloc[-1]
+        span_b=safe_last(
+            df["span_b"],
+            close
         )
     )
 
-    # ========================================================================
+    # ========================================================
     # MARKET STATE
-    # ========================================================================
+    # ========================================================
 
     market_state = (
-        MarketStateEngine
-        .classify_market_state(
-            df_calc,
+        MarketStateEngine.classify(
+            df,
             atr
         )
     )
 
-    # ========================================================================
-    # MTF
-    # ========================================================================
+    # ========================================================
+    # MULTI TIMEFRAME
+    # ========================================================
 
-    mft_res = (
-        MultiTimeframeHierarchy
-        .evaluate_all(
+    htf = (
+        MultiTimeframeEngine.evaluate(
             symbol
         )
     )
 
-    # ========================================================================
-    # SCORING
-    # ========================================================================
+    # ========================================================
+    # SETUP
+    # ========================================================
+
+    setup = SetupEngine.detect(
+        df,
+        metrics,
+        market_state,
+        htf
+    )
+
+    # ========================================================
+    # TRIGGER
+    # ========================================================
+
+    trigger = TriggerEngine.detect(
+        df,
+        metrics,
+        setup,
+        htf
+    )
+
+    # ========================================================
+    # SCORE
+    # ========================================================
 
     scoring = (
-        FactorScoringEngine
-        .compute_layered_score(
+        FactorScoringEngine.score(
             market_state,
-            df_calc,
+            df,
             metrics,
-            mft_res,
+            htf,
             futures_status,
             cvd_type
         )
     )
 
-    # ========================================================================
-    # SETUP
-    # ========================================================================
-
-    setup_type, setup_reason = (
-        SetupEngine
-        .detect_setup(
-            df_calc,
-            metrics,
-            market_state
-        )
-    )
-
-    # ========================================================================
-    # TRIGGER
-    # ========================================================================
-
-    trigger = (
-        TriggerEngine
-        .evaluate_trigger(
-            setup_type,
-            scoring,
-            mft_res,
-            metrics
-        )
-    )
-
-    # ========================================================================
+    # ========================================================
     # GRADE
-    # ========================================================================
+    # ========================================================
 
-    grade = (
-        SignalGradingEngine
-        .grade_signal(
-            scoring,
-            trigger,
-            setup_type
-        )
+    grade = SignalEngine.grade(
+        scoring.total_score,
+        setup,
+        trigger,
+        scoring.data_quality_pct,
+        htf
     )
 
-    # ========================================================================
-    # DIRECTION
-    # ========================================================================
+    # ========================================================
+    # FINAL DIRECTION
+    # ========================================================
 
-    if trigger == TriggerType.CONFIRMED_BUY:
+    if (
+        trigger
+        == TriggerType.CONFIRMED_BUY
+        and scoring.total_score >= 15
+        and scoring.data_quality_pct >= 60
+    ):
 
+        final_decision = "CONFIRMED LONG"
         direction = "LONG"
 
-    elif trigger == TriggerType.CONFIRMED_SELL:
+    elif (
+        trigger
+        == TriggerType.CONFIRMED_SELL
+        and scoring.total_score <= -15
+        and scoring.data_quality_pct >= 60
+    ):
 
+        final_decision = "CONFIRMED SHORT"
         direction = "SHORT"
 
     else:
 
+        final_decision = "NO TRADE / WAIT"
         direction = "NONE"
 
-    # ========================================================================
+    # ========================================================
     # TRADE PLAN
-    # ========================================================================
+    # ========================================================
 
-    trade_plan = (
-        TradeManagementEngine
-        .build_trade_plan(
-            direction,
-            df_calc,
-            metrics,
-            capital,
-            risk_pct
-        )
+    trade_plan = TradeManagement.build(
+        df,
+        metrics,
+        direction,
+        capital,
+        risk_pct
     )
 
-    current_price = float(
-        df_calc[
-            "close"
-        ].iloc[-1]
-    )
-
-    position_status = (
-        TradeStateEngine
-        .evaluate_position(
-            current_price,
-            trade_plan
-        )
-    )
-
-    # ========================================================================
+    # ========================================================
     # HEADER
-    # ========================================================================
+    # ========================================================
 
-    h1, h2, h3, h4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
 
-    with h1:
+    with c1:
 
         st.markdown(
             f"### {symbol}"
         )
 
         st.caption(
-            f"Price: ${current_price:,.4f}"
+            f"Price: ${close:,.4f}"
         )
 
-    with h2:
+    with c2:
 
-        badge = (
-            "status-badge-green"
-            if spot_status
-            == DataStatus.LIVE.value
-            else
-            "status-badge-yellow"
+        st.metric(
+            "Market State",
+            market_state.value
         )
 
-        st.markdown(
-            f"**Spot:** "
-            f"<span class='{badge}'>"
-            f"{spot_status}"
-            f"</span>",
-            unsafe_allow_html=True
+    with c3:
+
+        st.metric(
+            "Quant Score",
+            f"{scoring.total_score:+.1f}"
         )
 
-    with h3:
+    with c4:
 
-        badge = (
-            "status-badge-green"
-            if futures_status
-            == DataStatus.LIVE.value
-            else
-            "status-badge-yellow"
-        )
-
-        st.markdown(
-            f"**Futures:** "
-            f"<span class='{badge}'>"
-            f"{futures_status}"
-            f"</span>",
-            unsafe_allow_html=True
-        )
-
-    with h4:
-
-        badge = (
-            "status-badge-green"
-            if cvd_type
-            == DataStatus.LIVE.value
-            else
-            "status-badge-yellow"
-        )
-
-        st.markdown(
-            f"**CVD:** "
-            f"<span class='{badge}'>"
-            f"{cvd_type}"
-            f"</span>",
-            unsafe_allow_html=True
+        st.metric(
+            "Data Quality",
+            f"{scoring.data_quality_pct:.0f}%"
         )
 
     st.markdown("---")
 
-    # ========================================================================
+    # ========================================================
     # DECISION
-    # ========================================================================
+    # ========================================================
 
-    decision_col, setup_col = st.columns(
-        [1, 1]
+    color = (
+        "#00E676"
+        if "LONG" in final_decision
+        else
+        "#FF5252"
+        if "SHORT" in final_decision
+        else
+        "#FFD600"
     )
 
-    with decision_col:
+    st.markdown(
+        f"""
+        <div class="decision"
+             style="border-color:{color}">
 
-        st.subheader(
-            "🎯 القرار التنفيذي"
-        )
+            <h2 style="color:{color}">
+                {final_decision}
+            </h2>
 
-        score = scoring.total_score
+            <b>Setup:</b>
+            {setup.setup.value}
 
-        if (
-            trigger
-            == TriggerType.CONFIRMED_BUY
-            and scoring.data_quality_pct >= 60
-        ):
+            &nbsp;&nbsp;|&nbsp;&nbsp;
 
-            decision = "CONFIRMED LONG"
+            <b>Trigger:</b>
+            {trigger.value}
 
-        elif (
-            trigger
-            == TriggerType.CONFIRMED_SELL
-            and scoring.data_quality_pct >= 60
-        ):
+            <br><br>
 
-            decision = "CONFIRMED SHORT"
+            <b>Signal Grade:</b>
+            {grade.value}
 
-        else:
+            &nbsp;&nbsp;|&nbsp;&nbsp;
 
-            decision = "NO TRADE / WAIT"
+            <b>HTF:</b>
+            {htf["context_bias"]}
 
-        st.markdown(
-            f"""
-            <div class="trade-card">
+            <br><br>
 
-            <h2>{decision}</h2>
+            <b>Setup Reason:</b>
+            {setup.reason}
 
-            <p>
-            Score:
-            <b>{score:.1f}</b>
-            </p>
-
-            <p>
-            Grade:
-            <b>{grade.value}</b>
-            </p>
-
-            <p>
-            Data Quality:
-            <b>{scoring.data_quality_pct:.0f}%</b>
-            </p>
-
-            <p>
-            Market State:
-            <b>{market_state.value}</b>
-            </p>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with setup_col:
-
-        st.subheader(
-            "🧩 Setup / Trigger"
-        )
-
-        st.markdown(
-            f"""
-            **Setup:**  
-            `{setup_type.value}`
-
-            **Reason:**  
-            {setup_reason}
-
-            **Trigger:**  
-            `{trigger.value}`
-
-            **Grade:**  
-            `{grade.value}`
-            """
-        )
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     st.markdown("---")
 
-    # ========================================================================
-    # MTF
-    # ========================================================================
+    # ========================================================
+    # MULTI TF
+    # ========================================================
 
     st.subheader(
         "🧭 Multi-Timeframe Hierarchy"
@@ -2896,209 +2357,224 @@ def main():
         ]
     ):
 
-        with cols[i]:
+        frame = htf["frames"][tf]
 
-            st.metric(
-                tf.upper(),
-                f"{mft_res['scores'][tf]:.0f}",
-                mft_res["biases"][tf]
-            )
+        cols[i].metric(
+            tf.upper(),
+            frame["bias"],
+            f'{frame["score"]:.0f}'
+        )
 
-    st.info(
-        f"HTF Context: "
-        f"**{mft_res['context_bias']}** "
-        f"| Direction: "
-        f"**{mft_res['direction_bias']}** "
-        f"| Execution Score: "
-        f"**{mft_res['exec_score']:.1f}**"
-    )
+    # ========================================================
+    # FACTOR BREAKDOWN
+    # ========================================================
 
-    # ========================================================================
+    with st.expander(
+        "🧩 Layered Quantitative Scoring",
+        expanded=True
+    ):
+
+        f1, f2, f3, f4 = st.columns(4)
+
+        f1.metric(
+            "Direction",
+            f"{scoring.direction_score:+.1f}"
+        )
+
+        f2.metric(
+            "Flow / CVD",
+            f"{scoring.flow_score:+.1f}"
+        )
+
+        f3.metric(
+            "Positioning",
+            f"{scoring.positioning_score:+.1f}"
+        )
+
+        f4.metric(
+            "Location / VWAP",
+            f"{scoring.location_score:+.1f}"
+        )
+
+    # ========================================================
     # TRADE MANAGEMENT
-    # ========================================================================
+    # ========================================================
 
     st.markdown("---")
 
     st.subheader(
-        "🛡️ إدارة الصفقة"
+        "🎯 Trade Management"
     )
 
-    if direction != "NONE":
-
-        t1, t2, t3, t4 = st.columns(4)
-
-        with t1:
-
-            st.metric(
-                "Entry Reference",
-                f"{trade_plan.entry_reference:,.6f}"
-            )
-
-        with t2:
-
-            st.metric(
-                "Stop Loss",
-                f"{trade_plan.stop_loss:,.6f}"
-            )
-
-        with t3:
-
-            st.metric(
-                "TP1",
-                f"{trade_plan.tp1:,.6f}"
-            )
-
-        with t4:
-
-            st.metric(
-                "TP2",
-                f"{trade_plan.tp2:,.6f}"
-            )
-
-        t5, t6, t7, t8 = st.columns(4)
-
-        with t5:
-
-            st.metric(
-                "TP3",
-                f"{trade_plan.tp3:,.6f}"
-            )
-
-        with t6:
-
-            st.metric(
-                "Risk",
-                f"${trade_plan.dollar_risk:.2f}"
-            )
-
-        with t7:
-
-            st.metric(
-                "Position Size",
-                f"{trade_plan.position_size:.6f}"
-            )
-
-        with t8:
-
-            st.metric(
-                "Notional",
-                f"${trade_plan.position_notional:.2f}"
-            )
-
-        st.markdown(
-            f"""
-            **Entry Zone:**  
-            `{trade_plan.entry_low:,.6f}`
-            → `{trade_plan.entry_high:,.6f}`
-
-            **Risk / Reward:**  
-            TP1 = `{trade_plan.rr_tp1:.1f}R`  
-            TP2 = `{trade_plan.rr_tp2:.1f}R`  
-            TP3 = `{trade_plan.rr_tp3:.1f}R`
-
-            **Trailing Activation:**  
-            `{trade_plan.trailing_activation:,.6f}`
-
-            **Trailing Distance:**  
-            `{trade_plan.trailing_distance:,.6f}`
-
-            **Current Management Status:**  
-            `{position_status}`
-            """
-        )
+    if direction == "NONE":
 
         st.warning(
-            "إدارة الصفقة هنا هي خطة حسابية وليست تنفيذ أوامر حقيقية."
+            "لا توجد صفقة مؤكدة حالياً. "
+            "إدارة الصفقة لن تُنشأ قبل اكتمال Trigger."
         )
 
     else:
 
+        t1, t2, t3, t4 = st.columns(4)
+
+        t1.metric(
+            "Entry",
+            f"{trade_plan.entry_low:,.4f}"
+            f" – "
+            f"{trade_plan.entry_high:,.4f}"
+        )
+
+        t2.metric(
+            "Stop Loss",
+            f"{trade_plan.stop_loss:,.4f}"
+        )
+
+        t3.metric(
+            "TP1",
+            f"{trade_plan.tp1:,.4f}"
+        )
+
+        t4.metric(
+            "R:R TP1",
+            f"1:{trade_plan.rr_tp1:.2f}"
+        )
+
+        t5, t6, t7, t8 = st.columns(4)
+
+        t5.metric(
+            "TP2",
+            f"{trade_plan.tp2:,.4f}"
+        )
+
+        t6.metric(
+            "R:R TP2",
+            f"1:{trade_plan.rr_tp2:.2f}"
+        )
+
+        t7.metric(
+            "TP3",
+            f"{trade_plan.tp3:,.4f}"
+        )
+
+        t8.metric(
+            "Position Size",
+            f"{trade_plan.position_size:.6f}"
+        )
+
         st.info(
-            "لا توجد صفقة مؤكدة حالياً، لذلك لم يتم إنشاء Entry/SL/TP."
+            f"💰 Risk Amount: "
+            f"${trade_plan.risk_amount:.2f}"
+            f" | "
+            f"{trade_plan.invalidation}"
         )
 
-    # ========================================================================
-    # FACTOR BREAKDOWN
-    # ========================================================================
+    # ========================================================
+    # MARKET DATA DIAGNOSTICS
+    # ========================================================
 
-    st.markdown("---")
+    with st.expander(
+        "🔧 Engine Diagnostics",
+        expanded=False
+    ):
 
-    st.subheader(
-        "📊 Layered Quantitative Scoring"
-    )
+        diagnostics = {
 
-    f1, f2, f3, f4, f5 = st.columns(5)
+            "Market State":
+                market_state.value,
 
-    f1.metric(
-        "Direction",
-        scoring.direction_score
-    )
+            "Setup":
+                setup.setup.value,
 
-    f2.metric(
-        "Flow / CVD",
-        scoring.flow_score
-    )
+            "Setup Reason":
+                setup.reason,
 
-    f3.metric(
-        "Positioning",
-        scoring.positioning_score
-    )
+            "Trigger":
+                trigger.value,
 
-    f4.metric(
-        "Location / VWAP",
-        scoring.location_score
-    )
+            "Signal Grade":
+                grade.value,
 
-    f5.metric(
-        "TOTAL",
-        scoring.total_score
-    )
+            "HTF Context":
+                htf["context_bias"],
 
-    # ========================================================================
-    # MARKET DATA
-    # ========================================================================
+            "Execution Score":
+                round(
+                    htf["execution_score"],
+                    1
+                ),
 
-    st.markdown("---")
+            "CVD Type":
+                cvd_type,
 
-    d1, d2, d3, d4 = st.columns(4)
+            "CVD Slope":
+                round(
+                    metrics.cvd_slope,
+                    4
+                ),
 
-    with d1:
+            "CVD Divergence":
+                metrics.cvd_divergence,
 
-        st.metric(
-            "OI Change",
-            f"{oi_change_pct:+.2f}%"
+            "OI Change":
+                round(
+                    metrics.oi_change_pct,
+                    2
+                ),
+
+            "Funding":
+                metrics.funding_rate,
+
+            "Anchor":
+                anchor_reason,
+
+            "Spot Data":
+                spot_status,
+
+            "Futures Data":
+                futures_status,
+
+            "Data Quality":
+                scoring.data_quality_pct
+        }
+
+        st.json(diagnostics)
+
+    # ========================================================
+    # VWAP PANEL
+    # ========================================================
+
+    with st.expander(
+        "📊 VWAP / Market Location",
+        expanded=False
+    ):
+
+        v1, v2, v3, v4 = st.columns(4)
+
+        v1.metric(
+            "Session VWAP",
+            f"{metrics.vwap_session:,.4f}"
         )
 
-    with d2:
-
-        funding_text = (
-            "N/A"
-            if funding_rate is None
-            else f"{funding_rate:.5%}"
+        v2.metric(
+            "Weekly VWAP",
+            f"{metrics.vwap_weekly:,.4f}"
         )
 
-        st.metric(
-            "Funding",
-            funding_text
+        v3.metric(
+            "Monthly VWAP",
+            f"{metrics.vwap_monthly:,.4f}"
         )
 
-    with d3:
+        if metrics.vwap_anchored:
 
-        st.metric(
-            "CVD",
-            cvd_div
-        )
+            v4.metric(
+                "Anchored VWAP",
+                f"{metrics.vwap_anchored:,.4f}"
+            )
 
-    with d4:
-
-        st.metric(
-            "ATR",
-            f"{atr:.6f}"
-        )
-
-    # ========================================================================
+    # ========================================================
     # CHART
-    # ========================================================================
+    # ========================================================
 
     st.markdown("---")
 
@@ -3117,33 +2593,27 @@ def main():
         ]
     )
 
-    # ------------------------------------------------------------------------
-    # Candles
-    # ------------------------------------------------------------------------
-
+    # Price
     fig.add_trace(
         go.Candlestick(
-            x=df_calc["timestamp"],
-            open=df_calc["open"],
-            high=df_calc["high"],
-            low=df_calc["low"],
-            close=df_calc["close"],
+            x=df["timestamp"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
             name="Price"
         ),
         row=1,
         col=1
     )
 
-    # ------------------------------------------------------------------------
     # Ichimoku
-    # ------------------------------------------------------------------------
-
     fig.add_trace(
         go.Scatter(
-            x=df_calc["timestamp"],
-            y=df_calc["tenkan"],
-            mode="lines",
-            name="Tenkan"
+            x=df["timestamp"],
+            y=df["tenkan"],
+            name="Tenkan",
+            mode="lines"
         ),
         row=1,
         col=1
@@ -3151,10 +2621,22 @@ def main():
 
     fig.add_trace(
         go.Scatter(
-            x=df_calc["timestamp"],
-            y=df_calc["kijun"],
-            mode="lines",
-            name="Kijun"
+            x=df["timestamp"],
+            y=df["kijun"],
+            name="Kijun",
+            mode="lines"
+        ),
+        row=1,
+        col=1
+    )
+
+    # VWAP
+    fig.add_trace(
+        go.Scatter(
+            x=df["timestamp"],
+            y=vwap_session,
+            name="Session VWAP",
+            mode="lines"
         ),
         row=1,
         col=1
@@ -3162,54 +2644,10 @@ def main():
 
     fig.add_trace(
         go.Scatter(
-            x=df_calc["timestamp"],
-            y=df_calc["span_a"],
-            mode="lines",
-            name="Span A",
-            line=dict(
-                width=1
-            )
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_calc["timestamp"],
-            y=df_calc["span_b"],
-            mode="lines",
-            name="Span B",
-            fill="tonexty",
-            line=dict(
-                width=1
-            )
-        ),
-        row=1,
-        col=1
-    )
-
-    # ------------------------------------------------------------------------
-    # VWAP Suite
-    # ------------------------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_calc["timestamp"],
-            y=vwap_session_series,
-            mode="lines",
-            name="Session VWAP"
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_calc["timestamp"],
-            y=vwap_weekly_series,
-            mode="lines",
+            x=df["timestamp"],
+            y=vwap_weekly,
             name="Weekly VWAP",
+            mode="lines",
             line=dict(
                 dash="dash"
             )
@@ -3220,10 +2658,10 @@ def main():
 
     fig.add_trace(
         go.Scatter(
-            x=df_calc["timestamp"],
-            y=vwap_monthly_series,
-            mode="lines",
+            x=df["timestamp"],
+            y=vwap_monthly,
             name="Monthly VWAP",
+            mode="lines",
             line=dict(
                 dash="dot"
             )
@@ -3232,38 +2670,38 @@ def main():
         col=1
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=df_calc["timestamp"],
-            y=avwap_series,
-            mode="lines",
-            name="Smart Anchored VWAP",
-            line=dict(
-                width=2
-            )
-        ),
-        row=1,
-        col=1
-    )
+    if not avwap.isna().all():
 
-    # ------------------------------------------------------------------------
-    # Trade Management Lines
-    # ------------------------------------------------------------------------
-
-    if direction != "NONE":
-
-        fig.add_hline(
-            y=trade_plan.entry_reference,
-            line_dash="dot",
-            annotation_text="ENTRY",
+        fig.add_trace(
+            go.Scatter(
+                x=df["timestamp"],
+                y=avwap,
+                name="Smart Anchored VWAP",
+                mode="lines"
+            ),
             row=1,
             col=1
         )
 
+    # CVD
+    fig.add_trace(
+        go.Scatter(
+            x=df["timestamp"],
+            y=cvd_series,
+            name=f"CVD ({cvd_type})",
+            mode="lines"
+        ),
+        row=2,
+        col=1
+    )
+
+    # Trade levels
+    if direction != "NONE":
+
         fig.add_hline(
             y=trade_plan.stop_loss,
             line_dash="dash",
-            annotation_text="STOP",
+            annotation_text="SL",
             row=1,
             col=1
         )
@@ -3292,30 +2730,16 @@ def main():
             col=1
         )
 
-    # ------------------------------------------------------------------------
-    # CVD
-    # ------------------------------------------------------------------------
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_calc["timestamp"],
-            y=cvd_series,
-            mode="lines",
-            name=f"CVD ({cvd_type})"
-        ),
-        row=2,
-        col=1
-    )
-
     fig.update_layout(
         template="plotly_dark",
         height=700,
         margin=dict(
             l=10,
             r=10,
-            t=30,
+            t=20,
             b=10
         ),
+        xaxis_rangeslider_visible=False,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -3325,70 +2749,15 @@ def main():
         )
     )
 
-    fig.update_xaxes(
-        rangeslider_visible=False
-    )
-
     st.plotly_chart(
         fig,
         use_container_width=True
     )
 
-    # ========================================================================
-    # DIAGNOSTICS
-    # ========================================================================
 
-    with st.expander(
-        "🔧 Engine Diagnostics"
-    ):
-
-        st.write(
-            {
-                "Market State":
-                    market_state.value,
-
-                "Setup":
-                    setup_type.value,
-
-                "Setup Reason":
-                    setup_reason,
-
-                "Trigger":
-                    trigger.value,
-
-                "Signal Grade":
-                    grade.value,
-
-                "HTF Context":
-                    mft_res["context_bias"],
-
-                "Execution Score":
-                    mft_res["exec_score"],
-
-                "CVD Type":
-                    cvd_type,
-
-                "CVD Divergence":
-                    cvd_div,
-
-                "OI Change":
-                    oi_change_pct,
-
-                "Funding":
-                    funding_rate,
-
-                "Anchor":
-                    anchor_reason,
-
-                "Data Quality":
-                    scoring.data_quality_pct
-            }
-        )
-
-
-# ============================================================================
-# 15. ENTRY POINT
-# ============================================================================
+# ============================================================
+# 14. RUN
+# ============================================================
 
 if __name__ == "__main__":
     main()
