@@ -37,25 +37,30 @@ st.markdown("""
         border-radius: 10px;
         border: 1px solid #2b3245;
     }
-    p, span, label, div {
-        word-break: break-word !important;
-        white-space: normal !important;
+    /* Only wrap long Arabic body text inside our own custom blocks — never
+       apply break-word globally, since it shatters unbroken English words
+       (like "AliQuantFund") into a vertical letter stack on narrow screens. */
+    .aqf-rtl-text {
+        overflow-wrap: break-word;
+        white-space: normal;
     }
-    div[data-testid="stSidebarNav"], .css-1d33210, .st-emotion-cache-16idsys {
+    div[data-testid="stSidebarNav"] {
         display: none !important;
     }
     .status-badge-live {
-        background-color: #0e382c; color: #00e676; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #00e676;
+        background-color: #0e382c; color: #00e676; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #00e676; display: inline-block;
     }
     .status-badge-fallback {
-        background-color: #3d310d; color: #ffb300; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #ffb300;
+        background-color: #3d310d; color: #ffb300; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #ffb300; display: inline-block;
     }
     .status-badge-bad {
-        background-color: #3d0d0d; color: #ff5252; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #ff5252;
+        background-color: #3d0d0d; color: #ff5252; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #ff5252; display: inline-block;
     }
     .decision-box {
         padding: 16px; border-radius: 12px; margin-bottom: 14px; border: 2px solid;
+        color: #f0f2f6 !important;
     }
+    .decision-box * { color: #f0f2f6 !important; }
     .decision-confirmed-long { background-color: #0e382c; border-color: #00e676; }
     .decision-confirmed-short { background-color: #3d0d0d; border-color: #ff5252; }
     .decision-setup { background-color: #1d2a3d; border-color: #4fa3ff; }
@@ -161,9 +166,11 @@ class MarketDataLoader:
     @st.cache_data(ttl=25)
     def fetch_futures_metrics(symbol: str, interval: str, limit: int = 50) -> Tuple[Optional[pd.DataFrame], str, Dict[str, Any]]:
         """
-        Modular OI + Funding layer. Currently sourced from Bybit linear futures.
-        Designed so additional sources (e.g. Binance Futures, OKX) can be added
-        as extra try-blocks feeding the same normalized schema without touching callers.
+        Modular OI + Funding layer with two live sources, tried in order:
+        1) Bybit linear futures (primary)  2) Binance Futures (fallback, e.g. when
+        a symbol isn't listed/served on Bybit). Both normalize into the same
+        schema so callers never need to know which source responded. Designed
+        so further sources (e.g. OKX) can be appended as additional try-blocks.
         Returns: (oi_dataframe, status, funding_meta)
         """
         formatted_symbol = symbol.replace("/", "").upper()
@@ -206,6 +213,44 @@ class MarketDataLoader:
                         return df_oi, DataStatus.LIVE, funding_meta
         except Exception as e:
             logger.warning(f"Bybit OI/Funding fetch failed: {e}")
+
+        # --- Source 2: Binance Futures (fallback) ---
+        try:
+            binance_interval = interval if interval != '1d' else '1d'
+            # Binance openInterestHist only supports 5m/15m/30m/1h/2h/4h/6h/12h/1d
+            binance_oi_interval = interval if interval in ('5m', '15m', '1h', '4h', '1d') else '5m'
+            url_oi = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={formatted_symbol}&period={binance_oi_interval}&limit={limit}"
+            res_oi = requests.get(url_oi, headers=headers, timeout=4)
+
+            url_fr = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={formatted_symbol}&limit=50"
+            res_fr = requests.get(url_fr, headers=headers, timeout=4)
+
+            if res_oi.status_code == 200:
+                oi_data = res_oi.json()
+                if isinstance(oi_data, list) and len(oi_data) >= 3:
+                    df_oi = pd.DataFrame(oi_data)
+                    df_oi['openInterest'] = pd.to_numeric(df_oi['sumOpenInterest'], errors='coerce')
+                    df_oi['timestamp'] = pd.to_datetime(df_oi['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
+                    df_oi = df_oi.dropna(subset=['openInterest']).reset_index(drop=True)
+
+                    if res_fr.status_code == 200:
+                        fr_data = res_fr.json()
+                        if isinstance(fr_data, list) and fr_data:
+                            hist = []
+                            for row in reversed(fr_data):  # Binance returns oldest-first
+                                try:
+                                    hist.append(float(row.get('fundingRate', 0.0)))
+                                except Exception:
+                                    continue
+                            if hist:
+                                funding_meta['available'] = True
+                                funding_meta['current'] = hist[0]
+                                funding_meta['history'] = hist  # most-recent-first
+
+                    if len(df_oi) >= 3:
+                        return df_oi, DataStatus.FALLBACK, funding_meta
+        except Exception as e:
+            logger.warning(f"Binance Futures OI/Funding fetch failed: {e}")
 
         # --- Additional sources would be appended here as further try-blocks ---
 
