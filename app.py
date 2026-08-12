@@ -74,18 +74,11 @@ class QuantitativeMetrics:
     vwap_anchored: Optional[float] = None
     atr_14: float = 0.0
     cvd_slope: float = 0.0
-    cvd_divergence: str = "NONE"  # BULLISH, BEARISH, NONE
+    cvd_divergence: str = "NONE"
     oi_change_pct: float = 0.0
     oi_interpretation: str = "NEUTRAL"
     funding_rate: Optional[float] = None
     funding_bias: str = "NEUTRAL"
-
-@dataclass
-class MultiTimeframeFrame:
-    tf: str
-    bias: str  # BULLISH, BEARISH, NEUTRAL
-    vwap_relation: str
-    structure: str
 
 @dataclass
 class ScoringBreakdown:
@@ -97,72 +90,91 @@ class ScoringBreakdown:
     data_quality_pct: float = 100.0
 
 # -----------------------------------------------------------------------------
-# 2. DATA ACQUISITION & FALLBACK LAYER
+# 2. DATA ACQUISITION & MULTI-SERVER FALLBACK LAYER
 # -----------------------------------------------------------------------------
 class MarketDataLoader:
     
-    BYBIT_TF_MAP = {
-        '5m': '5',
-        '15m': '15',
-        '1h': '60',
-        '4h': '240',
-        '1d': 'D'
-    }
+    BYBIT_TF_MAP = {'5m': '5', '15m': '15', '1h': '60', '4h': '240', '1d': 'D'}
+    KUCOIN_TF_MAP = {'5m': '5min', '15m': '15min', '1h': '1hour', '4h': '4hour', '1d': '1day'}
 
     @staticmethod
     @st.cache_data(ttl=15)
-    def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[Optional[pd.DataFrame], str]:
+    def fetch_klines(symbol: str, interval: str, limit: int = 300) -> Tuple[Optional[pd.DataFrame], str]:
+        """جلب الشموع عبر 3 طبقات حماية لمنع الفشل تماماً على Streamlit Cloud"""
         formatted_symbol = symbol.replace("/", "").upper()
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
-        # Primary: Binance Spot
-        try:
-            url = f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}"
-            res = requests.get(url, headers=headers, timeout=4)
-            if res.status_code == 200:
-                data = res.json()
-                df = pd.DataFrame(data, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'
-                ])
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = df[col].astype(float)
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
-                return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.LIVE.value
-        except Exception as e:
-            logger.warning(f"Binance fetch failed: {e}")
+        # --- Layer 1: Binance Multi-Server Endpoints (Vision API Never Blocks IPs) ---
+        binance_endpoints = [
+            f"https://data-api.binance.vision/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+            f"https://api1.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+            f"https://api2.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+            f"https://api3.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
+            f"https://api.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}"
+        ]
 
-        # Fallback: Bybit Spot
+        for url in binance_endpoints:
+            try:
+                res = requests.get(url, headers=headers, timeout=3)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        df = pd.DataFrame(data, columns=[
+                            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                            'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'
+                        ])
+                        for col in ['open', 'high', 'low', 'close', 'volume']:
+                            df[col] = df[col].astype(float)
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
+                        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.LIVE.value
+            except Exception:
+                continue
+
+        # --- Layer 2: Bybit Spot API ---
         try:
             bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(interval, '5')
             url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval={bybit_tf}&limit={limit}"
             res = requests.get(url, headers=headers, timeout=4)
             if res.status_code == 200:
-                data = res.json().get('result', {}).get('list', [])
-                if data:
-                    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+                result = res.json().get('result', {}).get('list', [])
+                if result:
+                    df = pd.DataFrame(result, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
                     for col in ['open', 'high', 'low', 'close', 'volume']:
                         df[col] = df[col].astype(float)
                     df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms', utc=True).dt.tz_localize(None)
                     df = df.iloc[::-1].reset_index(drop=True)
                     return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.FALLBACK.value
         except Exception as e:
-            logger.warning(f"Bybit fetch failed: {e}")
+            logger.warning(f"Bybit kline fetch failed: {e}")
+
+        # --- Layer 3: KuCoin Public API (Fail-Safe) ---
+        try:
+            ku_symbol = f"{symbol.split('/')[0]}-USDT".upper()
+            ku_tf = MarketDataLoader.KUCOIN_TF_MAP.get(interval, '5min')
+            url = f"https://api.kucoin.com/api/v1/market/candles?symbol={ku_symbol}&type={ku_tf}"
+            res = requests.get(url, headers=headers, timeout=4)
+            if res.status_code == 200:
+                data = res.json().get('data', [])
+                if data:
+                    df = pd.DataFrame(data, columns=['timestamp', 'open', 'close', 'high', 'low', 'volume', 'turnover'])
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = df[col].astype(float)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='s', utc=True).dt.tz_localize(None)
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.FALLBACK.value
+        except Exception as e:
+            logger.warning(f"KuCoin kline fetch failed: {e}")
 
         return None, DataStatus.UNAVAILABLE.value
 
     @staticmethod
     @st.cache_data(ttl=15)
     def fetch_futures_metrics(symbol: str, interval: str, limit: int = 50) -> Tuple[Optional[pd.DataFrame], str, Dict[str, Any]]:
-        """
-        محرك المشتقات المحدث: يحاول جلب البيانات من Binance Futures أولاً (لأنها أكثر استقراراً على Streamlit) 
-        ثم ينقل إلى Bybit في حال التعذر.
-        """
         formatted_symbol = symbol.replace("/", "").upper()
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         funding_meta = {'available': False, 'current': None, 'history': []}
 
-        # --- Attempt 1: Binance Futures (Primary & Most Stable on Streamlit Cloud) ---
+        # --- Primary: Binance Futures ---
         try:
             binance_oi_interval = interval if interval in ('5m', '15m', '1h', '4h', '1d') else '5m'
             url_oi = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={formatted_symbol}&period={binance_oi_interval}&limit={limit}"
@@ -192,7 +204,7 @@ class MarketDataLoader:
         except Exception as e:
             logger.warning(f"Binance Futures fetch failed: {e}")
 
-        # --- Attempt 2: Bybit Linear (Fallback) ---
+        # --- Fallback: Bybit Linear ---
         try:
             bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(interval, '5')
             interval_time = f"{bybit_tf}" if interval != '1d' else '1d'
@@ -215,15 +227,14 @@ class MarketDataLoader:
     @staticmethod
     @st.cache_data(ttl=15)
     def fetch_recent_trades(symbol: str, limit: int = 1000) -> Tuple[Optional[pd.DataFrame], str]:
-        """جلب صفقات التداول مع دعم سيرفرات بديلة متعددة لمنع الحظر"""
         formatted_symbol = symbol.replace("/", "").upper()
         headers = {'User-Agent': 'Mozilla/5.0'}
 
         endpoints = [
-            f"https://api.binance.com/api/v3/trades?symbol={formatted_symbol}&limit={limit}",
+            f"https://data-api.binance.vision/api/v3/trades?symbol={formatted_symbol}&limit={limit}",
             f"https://api1.binance.com/api/v3/trades?symbol={formatted_symbol}&limit={limit}",
             f"https://api3.binance.com/api/v3/trades?symbol={formatted_symbol}&limit={limit}",
-            f"https://data-api.binance.vision/api/v3/trades?symbol={formatted_symbol}&limit={limit}"
+            f"https://api.binance.com/api/v3/trades?symbol={formatted_symbol}&limit={limit}"
         ]
 
         for url in endpoints:
@@ -257,7 +268,7 @@ class QuantitativeEngine:
         high_close = (df['high'] - df['close'].shift()).abs()
         low_close = (df['low'] - df['close'].shift()).abs()
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        return tr.rolling(period).mean()
+        return tr.rolling(period).mean().bfill().fillna(df['close'] * 0.01)
 
     @staticmethod
     def calculate_vwap(df: pd.DataFrame, anchor_type: str = 'SESSION') -> pd.Series:
@@ -280,8 +291,7 @@ class QuantitativeEngine:
 
     @staticmethod
     def detect_smart_anchor(df: pd.DataFrame) -> Tuple[int, str]:
-        """يكتشف تلقائياً أحدث شمعة حدث كبرى (Volatile Breakout or Max Volume Spike)"""
-        if len(df) < 50:
+        if len(df) < 30:
             return 0, "Initial"
         
         df_sub = df.tail(100).copy()
@@ -296,7 +306,6 @@ class QuantitativeEngine:
         typical_price = (df['high'] + df['low'] + df['close']) / 3.0
         pv = typical_price * df['volume']
         
-        # Zero out before anchor
         pv_anchored = pv.copy()
         vol_anchored = df['volume'].copy()
         
@@ -315,23 +324,19 @@ class QuantitativeEngine:
         df = df_klines.copy()
         
         if df_trades is not None and not df_trades.empty:
-            # Real Trade-Tape CVD Calculation
             df_trades['signed_vol'] = np.where(df_trades['is_buy'], df_trades['qty'], -df_trades['qty'])
-            # Resample to klines timeline
             trades_resampled = df_trades.set_index('time').resample('5min')['signed_vol'].sum().reindex(df['timestamp'], fill_value=0)
             cvd = trades_resampled.cumsum().reset_index(drop=True)
             cvd_type = DataStatus.LIVE.value
         else:
-            # Approximated CVD (Delta Approximation using candle body/range ratio)
             candle_range = (df['high'] - df['low']).replace(0, 1e-9)
             delta_approx = df['volume'] * ((df['close'] - df['open']) / candle_range)
             cvd = delta_approx.cumsum()
             cvd_type = DataStatus.APPROXIMATED.value
 
-        # Calculate CVD Slope & Divergence
-        price_change = df['close'].iloc[-1] - df['close'].iloc[-10]
-        cvd_change = cvd.iloc[-1] - cvd.iloc[-10]
-        cvd_slope = (cvd.iloc[-1] - cvd.iloc[-5]) / (abs(cvd.iloc[-5]) + 1e-9)
+        price_change = df['close'].iloc[-1] - df['close'].iloc[-10] if len(df) >= 10 else 0
+        cvd_change = cvd.iloc[-1] - cvd.iloc[-10] if len(cvd) >= 10 else 0
+        cvd_slope = (cvd.iloc[-1] - cvd.iloc[-5]) / (abs(cvd.iloc[-5]) + 1e-9) if len(cvd) >= 5 else 0
 
         divergence = "NONE"
         if price_change < 0 and cvd_change > 0:
@@ -376,7 +381,7 @@ class FactorScoringEngine:
         close = df['close'].iloc[-1]
         atr = metrics.atr_14 if metrics.atr_14 > 0 else 1.0
         
-        # 1. Direction Factor (25%)
+        # 1. Direction Factor
         ema_20 = df['close'].ewm(span=20).mean().iloc[-1]
         ema_50 = df['close'].ewm(span=50).mean().iloc[-1]
         dir_score = 0.0
@@ -389,7 +394,7 @@ class FactorScoringEngine:
         else:
             dir_score = -12.5
 
-        # 2. Flow Factor (CVD & Volume) (25%)
+        # 2. Flow Factor
         flow_score = 0.0
         if metrics.cvd_divergence == "BULLISH_ABSORPTION":
             flow_score = 25.0
@@ -398,34 +403,34 @@ class FactorScoringEngine:
         else:
             flow_score = np.clip(metrics.cvd_slope * 50.0, -20.0, 20.0)
 
-        # 3. Positioning Factor (OI & Funding) (25%)
+        # 3. Positioning Factor
         pos_score = 0.0
         if data_status_futures != DataStatus.UNAVAILABLE.value:
             if metrics.oi_change_pct > 2.0 and dir_score > 0:
-                pos_score += 15.0  # Long Accumulation
+                pos_score += 15.0
             elif metrics.oi_change_pct > 2.0 and dir_score < 0:
-                pos_score -= 15.0  # Short Accumulation
+                pos_score -= 15.0
             
             if metrics.funding_rate is not None:
                 if metrics.funding_rate < -0.0001:
-                    pos_score += 10.0  # Short Squeeze Potential
+                    pos_score += 10.0
                 elif metrics.funding_rate > 0.0003:
-                    pos_score -= 10.0  # Long Overheated
+                    pos_score -= 10.0
 
-        # 4. Location Factor (3-VWAP Distance / ATR) (25%)
+        # 4. Location Factor
         loc_score = 0.0
         dist_session_atr = (close - metrics.vwap_session) / atr
         
         if abs(dist_session_atr) <= 0.5:
-            loc_score = 25.0 if dir_score >= 0 else -25.0  # At Value Reclaim/Support
+            loc_score = 25.0 if dir_score >= 0 else -25.0
         elif dist_session_atr > 2.0:
-            loc_score = -15.0  # Overextended Bull
+            loc_score = -15.0
         elif dist_session_atr < -2.0:
-            loc_score = 15.0  # Overextended Bear
+            loc_score = 15.0
         else:
             loc_score = 10.0 if dist_session_atr > 0 else -10.0
 
-        # Adjust Weights Based on Market State
+        # Adjust Weights
         if market_state == MarketState.RANGE_COMPRESSION:
             loc_weight, flow_weight, dir_weight, pos_weight = 0.40, 0.30, 0.15, 0.15
         elif market_state in (MarketState.TRENDING_BULL, MarketState.TRENDING_BEAR):
@@ -435,7 +440,6 @@ class FactorScoringEngine:
 
         total = (dir_score * dir_weight) + (flow_score * flow_weight) + (pos_score * pos_weight) + (loc_score * loc_weight)
         
-        # Calculate Data Quality Percentage
         quality = 100.0
         if data_status_futures == DataStatus.UNAVAILABLE.value:
             quality -= 30.0
@@ -462,7 +466,6 @@ class FactorScoringEngine:
 def render_css():
     st.markdown("""
         <style>
-        /* Fix Vertical Text Collapsing */
         .stSidebar, div[data-testid="stSidebar"], div[data-testid="stSidebar"] * {
             word-break: normal !important;
             word-wrap: normal !important;
@@ -473,13 +476,6 @@ def render_css():
             font-weight: 800;
             color: #FAFAFA;
             margin-bottom: 0px;
-        }
-        .metric-card {
-            background-color: #1E222D;
-            border: 1px solid #2A2E39;
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 10px;
         }
         .status-badge-green {
             background-color: #133E2B;
@@ -511,21 +507,19 @@ def render_css():
 def main():
     render_css()
 
-    # Sidebar Navigation & Inputs
     with st.sidebar:
         st.title("⚡ AliQuantFund")
         st.caption("Institutional Control Center v4.0")
         st.markdown("---")
 
-        symbol = st.selectbox("المطالبة المالية (Symbol)", ["BTC/USDT", "ETH/USDT", "SOL/USDT"], index=0)
+        symbol = st.selectbox("المطالبة المالية (Symbol)", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"], index=0)
         timeframe = st.selectbox("الإطار الزمني التكتيكي (Setup TF)", ["5m", "15m", "1h", "4h"], index=1)
         
         st.markdown("---")
         auto_refresh = st.checkbox("تحديث تلقائي لحظي (Auto-Refresh)", value=True)
         st.markdown("---")
-        st.info("💡 يتم استخدام Binance Futures وسيرفرات متعددة كخيار أول لتفادي انقطاع البيانات على Streamlit.")
+        st.info("💡 تم تفعيل طبقات ربط متعددة لضمان استقرار الشموع والبيانات اللحظية.")
 
-    # Data Fetching Progress
     with st.spinner("جاري الاتصال بالمحركات الكمية وجلب البيانات..."):
         df_klines, spot_status = MarketDataLoader.fetch_klines(symbol, timeframe)
         df_futures, futures_status, funding_meta = MarketDataLoader.fetch_futures_metrics(symbol, timeframe)
@@ -535,7 +529,6 @@ def main():
         st.error("❌ تعذر جلب بيانات الشموع الأساسية من المصادر. يرجى التحقق من الاتصال.")
         return
 
-    # Quantitative Calculations
     atr = QuantitativeEngine.calculate_atr(df_klines).iloc[-1]
     vwap_sess = QuantitativeEngine.calculate_vwap(df_klines, 'SESSION').iloc[-1]
     vwap_week = QuantitativeEngine.calculate_vwap(df_klines, 'WEEKLY').iloc[-1]
@@ -546,7 +539,6 @@ def main():
     
     cvd_series, cvd_calc_type, cvd_slope = QuantitativeEngine.compute_cvd_metrics(df_klines, df_trades)
     
-    # Metrics Container
     oi_change_pct = 0.0
     if df_futures is not None and not df_futures.empty and len(df_futures) >= 2:
         oi_start = df_futures['openInterest'].iloc[0]
@@ -569,7 +561,6 @@ def main():
         market_state, df_klines, metrics, futures_status, cvd_calc_type
     )
 
-    # Top Status Bar
     col_head1, col_head2, col_head3, col_head4 = st.columns(4)
     with col_head1:
         st.markdown(f"### {symbol}")
@@ -586,7 +577,6 @@ def main():
 
     st.markdown("---")
 
-    # Decision Banner
     dec_col1, dec_col2 = st.columns([1, 2])
     
     with dec_col1:
@@ -622,7 +612,6 @@ def main():
 
     st.markdown("---")
 
-    # Interactive Chart Section
     st.subheader(f"📈 شارت {symbol} التكتيكي المدمج مع الـ VWAP والـ CVD")
     
     fig = make_subplots(
@@ -632,7 +621,6 @@ def main():
         row_heights=[0.7, 0.3]
     )
 
-    # Candlestick
     fig.add_trace(go.Candlestick(
         x=df_klines['timestamp'],
         open=df_klines['open'],
@@ -642,11 +630,9 @@ def main():
         name="Price"
     ), row=1, col=1)
 
-    # VWAP Overlay
     fig.add_trace(go.Scatter(x=df_klines['timestamp'], y=df_klines['close'].assign(v=vwap_sess)['v'], mode='lines', name='Session VWAP', line=dict(color='#FFD600', width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df_klines['timestamp'], y=df_klines['close'].assign(v=vwap_week)['v'], mode='lines', name='Weekly VWAP', line=dict(color='#00E676', width=1.5, dash='dash')), row=1, col=1)
 
-    # CVD Plot
     fig.add_trace(go.Scatter(
         x=df_klines['timestamp'], 
         y=cvd_series, 
