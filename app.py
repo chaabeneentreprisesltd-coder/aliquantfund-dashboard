@@ -4,9 +4,9 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
-from datetime import datetime, timezone
+from datetime import datetime
 import logging
 
 # ==========================================
@@ -49,9 +49,6 @@ st.markdown("""
     .status-badge-fallback {
         background-color: #3d310d; color: #ffb300; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #ffb300;
     }
-    .status-badge-unavail {
-        background-color: #3a161a; color: #ff5252; padding: 4px 10px; border-radius: 6px; font-weight: bold; border: 1px solid #ff5252;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,25 +59,9 @@ st.markdown("""
 class DataStatus:
     LIVE = "LIVE"
     FALLBACK = "FALLBACK"
-    DELAYED = "DELAYED"
     UNAVAILABLE = "UNAVAILABLE"
 
-@dataclass
-class MarketDataContainer:
-    symbol: str
-    interval: str
-    spot_df: pd.DataFrame
-    futures_df: Optional[pd.DataFrame] = None
-    orderflow_df: Optional[pd.DataFrame] = None
-    data_quality_score: int = 100
-    status_spot: str = DataStatus.UNAVAILABLE
-    status_futures: str = DataStatus.UNAVAILABLE
-    status_orderflow: str = DataStatus.UNAVAILABLE
-    is_real_cvd: bool = False
-    source_info: str = ""
-
 class MarketDataLoader:
-    """طبقة البيانات المدمجة لجلب بيانات Spot و Futures و Order Flow مع Fallbacks و Quality Assessment"""
     
     BYBIT_TF_MAP = {'5m': '5', '15m': '15', '1h': '60', '4h': '240', '1d': 'D'}
     
@@ -90,7 +71,6 @@ class MarketDataLoader:
         formatted_symbol = symbol.replace("/", "").upper()
         headers = {'User-Agent': 'Mozilla/5.0'}
         
-        # Primary Source: Binance Spot API
         endpoints = [
             f"https://api1.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
             f"https://api3.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
@@ -110,11 +90,9 @@ class MarketDataLoader:
                     for col in ['open', 'high', 'low', 'close', 'volume']:
                         df[col] = df[col].astype(float)
                     return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.LIVE, "Binance Spot Direct"
-            except Exception as e:
-                logger.warning(f"Binance endpoint failed: {url}, error: {e}")
+            except Exception:
                 continue
 
-        # Secondary Fallback Source: Bybit Spot API
         try:
             bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(interval, '5')
             url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval={bybit_tf}&limit={limit}"
@@ -128,21 +106,19 @@ class MarketDataLoader:
                     for col in ['open', 'high', 'low', 'close', 'volume']:
                         df[col] = df[col].astype(float)
                     return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.FALLBACK, "Bybit Spot API"
-        except Exception as e:
-            logger.error(f"Bybit Spot API failed: {e}")
+        except Exception:
+            pass
             
         return None, DataStatus.UNAVAILABLE, "None"
 
     @staticmethod
     @st.cache_data(ttl=25)
     def fetch_futures_metrics(symbol: str, interval: str, limit: int = 50) -> Tuple[Optional[pd.DataFrame], str]:
-        """جلب بيانات الماركت الآجل: Open Interest و Funding Rate"""
         formatted_symbol = symbol.replace("/", "").upper()
         headers = {'User-Agent': 'Mozilla/5.0'}
         bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(interval, '5')
         
         try:
-            # Bybit Linear Futures Market
             url_oi = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={formatted_symbol}&intervalTime={bybit_tf}m&limit={limit}"
             if interval == '1d':
                 url_oi = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={formatted_symbol}&intervalTime=1d&limit={limit}"
@@ -160,7 +136,6 @@ class MarketDataLoader:
                     df_oi['timestamp'] = pd.to_datetime(df_oi['timestamp'].astype(float), unit='ms')
                     df_oi = df_oi.iloc[::-1].reset_index(drop=True)
                     
-                    # Fetch current funding rate
                     funding_rate = 0.0001
                     if res_fr.status_code == 200:
                         fr_list = res_fr.json().get('result', {}).get('list', [])
@@ -169,19 +144,17 @@ class MarketDataLoader:
                             
                     df_oi['funding_rate'] = funding_rate
                     return df_oi, DataStatus.LIVE
-        except Exception as e:
-            logger.warning(f"Futures Metrics fetch error: {e}")
+        except Exception:
+            pass
             
         return None, DataStatus.UNAVAILABLE
 
     @staticmethod
     @st.cache_data(ttl=15)
     def fetch_trade_level_orderflow(symbol: str, limit: int = 500) -> Tuple[Optional[pd.DataFrame], bool, str]:
-        """جلب صفقات السوق اللحظية (Recent Trades) لبناء Real CVD عند توفرها"""
         formatted_symbol = symbol.replace("/", "").upper()
         headers = {'User-Agent': 'Mozilla/5.0'}
         
-        # Attempt 1: Binance Public Recent Trades
         url = f"https://api1.binance.com/api/v3/trades?symbol={formatted_symbol}&limit={limit}"
         try:
             res = requests.get(url, headers=headers, timeout=3)
@@ -189,16 +162,13 @@ class MarketDataLoader:
                 trades = res.json()
                 if isinstance(trades, list) and len(trades) > 0:
                     df_trades = pd.DataFrame(trades)
-                    # price, qty, time, isBuyerMaker
                     df_trades['price'] = df_trades['price'].astype(float)
                     df_trades['qty'] = df_trades['qty'].astype(float)
                     df_trades['time'] = pd.to_datetime(df_trades['time'], unit='ms')
-                    # isBuyerMaker True -> Seller initiated (Sell Volume)
-                    # isBuyerMaker False -> Buyer initiated (Buy Volume)
                     df_trades['is_buy'] = ~df_trades['isBuyerMaker']
                     return df_trades, True, DataStatus.LIVE
-        except Exception as e:
-            logger.warning(f"Trade level data fetch failed: {e}")
+        except Exception:
+            pass
             
         return None, False, DataStatus.FALLBACK
 
@@ -214,11 +184,11 @@ class QuantitativeEngine:
         high_close = (df['high'] - df['close'].shift()).abs()
         low_close = (df['low'] - df['close'].shift()).abs()
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        return tr.rolling(period).mean().bfill()
+        res = tr.rolling(period).mean().bfill()
+        return res.fillna(df['close'] * 0.01)
 
     @staticmethod
     def calculate_adx_trend(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """حساب ADX لتقييم قوة الاتجاه بدون Look-Ahead Bias"""
         df_copy = df.copy()
         up_move = df_copy['high'] - df_copy['high'].shift(1)
         down_move = df_copy['low'].shift(1) - df_copy['low']
@@ -238,8 +208,7 @@ class QuantitativeEngine:
 
     @staticmethod
     def detect_smart_anchor(df: pd.DataFrame, mode: str = "Automatic") -> Dict[str, Any]:
-        """كاشف المرساة الذكي (Smart Anchor Detection) يعتمد على السلوك السعري والسيولة"""
-        if df is None or len(df) < 30:
+        if df is None or len(df) < 5:
             return {'index': 0, 'price': df['close'].iloc[0] if df is not None else 0, 'timestamp': df['timestamp'].iloc[0] if df is not None else datetime.now(), 'type': 'Default'}
 
         if mode == "Swing High":
@@ -249,16 +218,13 @@ class QuantitativeEngine:
             idx = df['low'].idxmin()
             return {'index': idx, 'price': df.loc[idx, 'low'], 'timestamp': df.loc[idx, 'timestamp'], 'type': 'Swing Low'}
         
-        # Automatic Mode: Search for Significant Volume Spike or Structure Pivot
         vol_ma = df['volume'].rolling(20).mean()
         vol_spike_mask = df['volume'] > (vol_ma * 2.2)
         
         if vol_spike_mask.any():
-            # Pick the index of the largest volume spike in the frame
             idx = df.loc[vol_spike_mask, 'volume'].idxmax()
             anchor_type = "Major Volume Spike"
         else:
-            # Fallback to absolute local Swing Low
             idx = df['low'].idxmin()
             anchor_type = "Structural Pivot Low"
             
@@ -270,18 +236,27 @@ class QuantitativeEngine:
         }
 
     @staticmethod
-    def calculate_vwap_suite(df: pd.DataFrame, anchor_info: Dict[str, Any]) -> pd.DataFrame:
+    def calculate_indicators(df: pd.DataFrame, anchor_info: Dict[str, Any]) -> pd.DataFrame:
+        """دالة مدمجة لحساب جميع المؤشرات والـ VWAPs لضمان وجود أعمدة atr دائماً"""
+        if df is None or df.empty:
+            return df
+            
         df = df.copy()
+        
+        # 1. ATR (14)
+        df['atr'] = QuantitativeEngine.calculate_atr(df, period=14)
+
+        # 2. VWAP Suite
         df['tp'] = (df['high'] + df['low'] + df['close']) / 3
         df['pv'] = df['tp'] * df['volume']
         
-        # Session VWAP (Resets daily at 00:00 UTC)
+        # Session VWAP
         df['date'] = df['timestamp'].dt.date
         session_pv = df.groupby('date')['pv'].cumsum()
         session_vol = df.groupby('date')['volume'].cumsum()
         df['vwap_session'] = np.where(session_vol > 0, session_pv / session_vol, df['tp'])
         
-        # Weekly VWAP (Resets weekly)
+        # Weekly VWAP
         df['week_year'] = df['timestamp'].dt.strftime('%Y-%U')
         weekly_pv = df.groupby('week_year')['pv'].cumsum()
         weekly_vol = df.groupby('week_year')['volume'].cumsum()
@@ -301,25 +276,20 @@ class QuantitativeEngine:
 
     @staticmethod
     def build_orderflow_cvd(df: pd.DataFrame, df_trades: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, bool]:
-        """بناء CVD الحقيقي من Trade Level أو Approximate CVD عند تعذر البيانات"""
         df = df.copy()
         
         if df_trades is not None and not df_trades.empty:
-            # Real Trade Level Delta
             buy_vol = df_trades[df_trades['is_buy']]['qty'].sum()
             sell_vol = df_trades[~df_trades['is_buy']]['qty'].sum()
             net_delta = buy_vol - sell_vol
             
-            # Approximate candles delta mapped with real last delta bias
             prev_close = df['close'].shift(1).bfill()
             direction = np.where(df['close'] >= prev_close, 1, -1)
             df['delta'] = df['volume'] * direction
-            # Adjust latest candle delta with trade level intensity
             df.loc[df.index[-1], 'delta'] = net_delta
             df['cvd'] = df['delta'].cumsum()
             return df, True
         else:
-            # Approximate CVD (Fallback)
             prev_close = df['close'].shift(1).bfill()
             direction = np.where(df['close'] >= prev_close, 1, -1)
             df['delta'] = df['volume'] * direction
@@ -328,8 +298,7 @@ class QuantitativeEngine:
 
     @staticmethod
     def detect_market_regime(df: pd.DataFrame) -> str:
-        """كشف حالة النظام الساعي (Market Regime) بدقة لمنع التداول الخاطئ"""
-        if len(df) < 30:
+        if len(df) < 15:
             return "RANGING"
             
         atr = QuantitativeEngine.calculate_atr(df, 14)
@@ -340,8 +309,7 @@ class QuantitativeEngine:
         latest_pdi = plus_di.iloc[-1]
         latest_mdi = minus_di.iloc[-1]
         
-        # Volatility Check
-        vol_ma = df['volume'].rolling(20).mean()
+        vol_ma = df['volume'].rolling(20).mean().bfill()
         is_high_vol = atr_pct > 2.5 or (df['volume'].iloc[-1] > vol_ma.iloc[-1] * 2.0)
         
         if latest_adx > 25:
@@ -361,7 +329,6 @@ class QuantitativeEngine:
 # ==========================================
 
 class FactorScoringEngine:
-    """محرك التقييم متعدد العوامل - يمنع Double Counting ويزن المؤشرات حسب نظام السوق"""
     
     @staticmethod
     def evaluate_factors(
@@ -371,50 +338,44 @@ class FactorScoringEngine:
         regime: str
     ) -> Dict[str, Any]:
         
+        if df is None or df.empty or 'atr' not in df.columns:
+            return {
+                'global_score': 50.0, 'price_score': 50.0, 'orderflow_score': 50.0,
+                'positioning_score': 50.0, 'trend_score': 50.0, 'vwap_score': 50.0,
+                'oi_state': 'Neutral', 'distances_atr': {'session': 0, 'weekly': 0, 'anchored': 0}
+            }
+            
         latest = df.iloc[-1]
-        atr = max(latest['atr'], 1e-5)
+        atr = max(latest.get('atr', latest['close'] * 0.01), 1e-5)
         
-        # ------------------------------------
-        # Factor 1: PRICE STRUCTURE (0 - 100)
-        # ------------------------------------
-        # Break of Structure & Candle Momentum
-        prev_10_high = df['high'].iloc[-11:-1].max()
-        prev_10_low = df['low'].iloc[-11:-1].min()
+        # 1. Price Structure
+        prev_10_high = df['high'].iloc[-11:-1].max() if len(df) >= 11 else df['high'].max()
+        prev_10_low = df['low'].iloc[-11:-1].min() if len(df) >= 11 else df['low'].min()
         
         price_score = 50.0
         if latest['close'] > prev_10_high:
-            price_score = 85.0 # Bullish Breakout
+            price_score = 85.0
         elif latest['close'] < prev_10_low:
-            price_score = 15.0 # Bearish Breakdown
+            price_score = 15.0
         else:
-            # Range relative position
             rng = max(prev_10_high - prev_10_low, 1e-5)
             price_score = 30.0 + ((latest['close'] - prev_10_low) / rng) * 40.0
 
-        # ------------------------------------
-        # Factor 2: ORDER FLOW & CVD (0 - 100)
-        # ------------------------------------
+        # 2. Order Flow & CVD
         of_score = 50.0
-        if len(df) >= 10:
+        if len(df) >= 10 and 'cvd' in df.columns:
             cvd_delta = df['cvd'].iloc[-1] - df['cvd'].iloc[-10]
             price_delta = df['close'].iloc[-1] - df['close'].iloc[-10]
             
-            if cvd_delta > 0 and price_delta > 0:
-                of_score = 80.0 # Aggressive Long Buying
-            elif cvd_delta < 0 and price_delta < 0:
-                of_score = 20.0 # Aggressive Short Selling
-            elif cvd_delta > 0 and price_delta < 0:
-                of_score = 65.0 # Bullish Absorption (تجميع)
-            elif cvd_delta < 0 and price_delta > 0:
-                of_score = 35.0 # Bearish Distribution (تصريف)
+            if cvd_delta > 0 and price_delta > 0: of_score = 80.0
+            elif cvd_delta < 0 and price_delta < 0: of_score = 20.0
+            elif cvd_delta > 0 and price_delta < 0: of_score = 65.0
+            elif cvd_delta < 0 and price_delta > 0: of_score = 35.0
                 
-        # Discount score if using Approximated CVD
         if not is_real_cvd:
             of_score = 50.0 + (of_score - 50.0) * 0.5
 
-        # ------------------------------------
-        # Factor 3: POSITIONING & OI (0 - 100)
-        # ------------------------------------
+        # 3. Positioning & OI
         positioning_score = 50.0
         oi_state_desc = "Neutral Positioning"
         
@@ -425,21 +386,15 @@ class FactorScoringEngine:
             oi_chg = (latest_oi - prev_oi) / prev_oi if prev_oi > 0 else 0
             
             if oi_chg > 0.01 and price_chg > 0:
-                positioning_score = 85.0
-                oi_state_desc = "Long Build-up (صعود مدعوم برؤوس أموال جديدة)"
+                positioning_score = 85.0; oi_state_desc = "Long Build-up"
             elif oi_chg > 0.01 and price_chg < 0:
-                positioning_score = 15.0
-                oi_state_desc = "Short Build-up (هبوط مدعوم بدخول صفقات شورت)"
+                positioning_score = 15.0; oi_state_desc = "Short Build-up"
             elif oi_chg < -0.01 and price_chg > 0:
-                positioning_score = 40.0
-                oi_state_desc = "Short Covering (صعود إجبار بسبب إغلاق الشورت)"
+                positioning_score = 40.0; oi_state_desc = "Short Covering"
             elif oi_chg < -0.01 and price_chg < 0:
-                positioning_score = 60.0
-                oi_state_desc = "Long Unwinding (تصفية صفقات شراء)"
+                positioning_score = 60.0; oi_state_desc = "Long Unwinding"
 
-        # ------------------------------------
-        # Factor 4: TREND & REGIME ALIGNMENT (0 - 100)
-        # ------------------------------------
+        # 4. Trend Alignment
         adx, pdi, mdi = QuantitativeEngine.calculate_adx_trend(df)
         trend_score = 50.0
         if pdi.iloc[-1] > mdi.iloc[-1]:
@@ -447,25 +402,20 @@ class FactorScoringEngine:
         else:
             trend_score = 50.0 - min(adx.iloc[-1] * 1.0, 45.0)
 
-        # ------------------------------------
-        # Factor 5: VWAP LOCATION (0 - 100)
-        # ------------------------------------
-        d_sess = (latest['close'] - latest['vwap_session']) / atr
-        d_week = (latest['close'] - latest['vwap_weekly']) / atr
-        d_anc = (latest['close'] - latest['vwap_anchored']) / atr
+        # 5. VWAP Location
+        d_sess = (latest['close'] - latest.get('vwap_session', latest['close'])) / atr
+        d_week = (latest['close'] - latest.get('vwap_weekly', latest['close'])) / atr
+        d_anc = (latest['close'] - latest.get('vwap_anchored', latest['close'])) / atr
         
-        # Volatility-Normalized Distance Score
         avg_distance_atr = (d_sess + d_week + d_anc) / 3.0
         vwap_score = np.clip(50.0 + (avg_distance_atr * 20.0), 0.0, 100.0)
 
-        # ------------------------------------
-        # REGIME-WEIGHTED COMBINATION
-        # ------------------------------------
+        # Regime Weights
         if regime in ["TRENDING BULL", "TRENDING BEAR"]:
             weights = {'price': 0.25, 'orderflow': 0.20, 'positioning': 0.15, 'trend': 0.25, 'vwap': 0.15}
         elif regime == "HIGH VOLATILITY":
             weights = {'price': 0.15, 'orderflow': 0.35, 'positioning': 0.20, 'trend': 0.10, 'vwap': 0.20}
-        else: # RANGING / LOW VOLATILITY
+        else:
             weights = {'price': 0.20, 'orderflow': 0.25, 'positioning': 0.15, 'trend': 0.10, 'vwap': 0.30}
 
         global_score = (
@@ -488,14 +438,13 @@ class FactorScoringEngine:
         }
 
 # ==========================================
-# 4. MULTI-TIMEFRAME & ENTRY SETUP ENGINE
+# 4. MULTI-TIMEFRAME ENGINE
 # ==========================================
 
 class MultiTimeframeEngine:
     
     @staticmethod
     def evaluate_mft(symbol: str, anchor_mode: str) -> Dict[str, Any]:
-        """محرك الأطر الزمنية المتعددة المبني على التسلسل الهرمي (HTF Bias -> Exec)"""
         timeframes = ['1d', '4h', '1h', '15m', '5m']
         scores = {}
         regimes = {}
@@ -504,7 +453,7 @@ class MultiTimeframeEngine:
             df_spot, spot_status, _ = MarketDataLoader.fetch_spot_ohlcv(symbol, tf, limit=100)
             if df_spot is not None and not df_spot.empty:
                 anchor_info = QuantitativeEngine.detect_smart_anchor(df_spot, mode=anchor_mode)
-                df_calc = QuantitativeEngine.calculate_vwap_suite(df_spot, anchor_info)
+                df_calc = QuantitativeEngine.calculate_indicators(df_spot, anchor_info)
                 df_calc, is_real = QuantitativeEngine.build_orderflow_cvd(df_calc, None)
                 regime = QuantitativeEngine.detect_market_regime(df_calc)
                 
@@ -515,7 +464,6 @@ class MultiTimeframeEngine:
                 scores[tf] = 50.0
                 regimes[tf] = "NEUTRAL"
                 
-        # HTF Bias Hierarchy (1D + 4H)
         htf_score = (scores['1d'] * 0.6) + (scores['4h'] * 0.4)
         if htf_score >= 65:
             htf_bias = "BULLISH 🟢"
@@ -524,7 +472,6 @@ class MultiTimeframeEngine:
         else:
             htf_bias = "NEUTRAL 🟡"
             
-        # Execution Trigger Alignment (15M + 5M)
         exec_score = (scores['15m'] * 0.5) + (scores['5m'] * 0.5)
         
         return {
@@ -552,23 +499,20 @@ class SignalAndRiskEngine:
         reasons = []
         confidence = int(min(data_quality_score, 100))
         
-        # Rule: Low Data Quality Penalty
         if data_quality_score < 60:
             confidence -= 20
             reasons.append("⚠️ بيانات محدودة - تم تخفيض درجة الثقة تلقائياً.")
 
-        # Hierarchy Mapping
         if global_score >= 82 and "BULLISH" in htf_bias:
             grade = "A+ LONG"
             confidence = int(min(confidence * 0.95, 95))
             reasons.append("توافق تام بين الاتجاه العام الكلي (HTF) والسيولة اللحظية.")
-            reasons.append("السعر في حالة صعود مؤسسي مدعوم بإنشائه لقيم سعرية جديدة فوق الـ VWAPs.")
         elif global_score >= 70 and "BEARISH" not in htf_bias:
             grade = "A LONG"
-            reasons.append("زخم شراء إيجابي جيد يدعم صفقات الشراء مع حذر جزئي.")
+            reasons.append("زخم شراء إيجابي جيد يدعم صفقات الشراء.")
         elif global_score >= 60:
             grade = "B LONG"
-            reasons.append("إشارة شراء مضاربية صغرى (Scalp) عكس أو حياد الاتجاه الكلي.")
+            reasons.append("إشارة شراء مضاربية صغرى (Scalp).")
         elif global_score <= 18 and "BEARISH" in htf_bias:
             grade = "A+ SHORT"
             confidence = int(min(confidence * 0.95, 95))
@@ -581,7 +525,7 @@ class SignalAndRiskEngine:
             reasons.append("إشارة بيع مضاربية صغرى احترازية.")
         else:
             grade = "NEUTRAL"
-            reasons.append("تضارب بين السيولة والاتجاه السائدي - يفضل الانتظار خارج السوق.")
+            reasons.append("تضارب بين السيولة والاتجاه السائدي - يفضل الانتظار.")
             
         return grade, max(confidence, 10), reasons
 
@@ -596,34 +540,21 @@ class SignalAndRiskEngine:
         grade: str,
         regime: str
     ) -> Dict[str, Any]:
-        """حساب مستويات الستوب والهجمات الذكية ومنع المعاملات السالبة أو غير المنطقية"""
         
-        # Buffer distance using ATR to prevent noise stop-outs
         atr_buffer = atr * 0.5
         
         if is_long:
-            # Stop Loss must be BELOW entry
             calculated_sl = min(sl_source_price - atr_buffer, entry_price - (atr * 0.8))
             sl_distance = entry_price - calculated_sl
             tp1 = entry_price + (sl_distance * 1.5)
             tp2 = entry_price + (sl_distance * 3.0)
         else:
-            # Stop Loss must be ABOVE entry
             calculated_sl = max(sl_source_price + atr_buffer, entry_price + (atr * 0.8))
             sl_distance = calculated_sl - entry_price
             tp1 = entry_price - (sl_distance * 1.5)
             tp2 = entry_price - (sl_distance * 3.0)
 
-        # Dynamic Grade Sizing Multiplier
-        grade_multiplier = 1.0
-        if "A+" in grade:
-            grade_multiplier = 1.0
-        elif "A" in grade:
-            grade_multiplier = 0.75
-        elif "B" in grade:
-            grade_multiplier = 0.40
-        else:
-            grade_multiplier = 0.0
+        grade_multiplier = 1.0 if "A+" in grade else (0.75 if "A" in grade else (0.40 if "B" in grade else 0.0))
 
         effective_risk_pct = base_risk_pct * grade_multiplier
         risk_amount = capital * (effective_risk_pct / 100.0)
@@ -632,83 +563,55 @@ class SignalAndRiskEngine:
         position_value = units * entry_price
         
         return {
-            'entry': entry_price,
-            'sl': calculated_sl,
-            'tp1': tp1,
-            'tp2': tp2,
-            'sl_distance': sl_distance,
-            'risk_amount': risk_amount,
-            'effective_risk_pct': effective_risk_pct,
-            'units': units,
-            'position_value': position_value,
-            'rr_tp1': 1.5,
-            'rr_tp2': 3.0
+            'entry': entry_price, 'sl': calculated_sl, 'tp1': tp1, 'tp2': tp2,
+            'sl_distance': sl_distance, 'risk_amount': risk_amount,
+            'effective_risk_pct': effective_risk_pct, 'units': units,
+            'position_value': position_value, 'rr_tp1': 1.5, 'rr_tp2': 3.0
         }
 
 # ==========================================
 # 6. STREAMLIT USER INTERFACE LAYER
 # ==========================================
 
-# --- Sidebar Controls ---
 st.sidebar.title("⚡ AliQuantFund")
 st.sidebar.caption("Institutional Market Engine v3.0")
 st.sidebar.markdown("---")
 
-selected_symbol = st.sidebar.selectbox(
-    "الأصل المالي (Symbol):",
-    ["BTC/USDT", "ETH/USDT", "ZEC/USDT", "XRP/USDT", "SOL/USDT"]
-)
-
-selected_tf = st.sidebar.selectbox(
-    "الإطار الزمني للتنفيذ (Execution TF):",
-    ["5m", "15m", "1h", "4h", "1d"],
-    index=0
-)
-
-anchor_mode = st.sidebar.selectbox(
-    "نمط وضع مرساة الـ VWAP (Smart Anchor):",
-    ["Automatic", "Swing High", "Swing Low"]
-)
+selected_symbol = st.sidebar.selectbox("الأصل المالي (Symbol):", ["BTC/USDT", "ETH/USDT", "ZEC/USDT", "XRP/USDT", "SOL/USDT"])
+selected_tf = st.sidebar.selectbox("الإطار الزمني للتنفيذ (Execution TF):", ["5m", "15m", "1h", "4h", "1d"], index=0)
+anchor_mode = st.sidebar.selectbox("نمط مرساة الـ VWAP:", ["Automatic", "Swing High", "Swing Low"])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📐 إدارة رأس المال")
 capital = st.sidebar.number_input("رأس المال ($):", value=100.0, step=10.0)
 base_risk_pct = st.sidebar.number_input("أقصى نسبة مخاطرة (%):", value=2.0, step=0.5)
 
-# --- MAIN CONTROLLER ---
 st.title(f"📊 التحليل الكمي المؤسسي: {selected_symbol}")
 
-# Fetch Data
 spot_df, spot_status, spot_source = MarketDataLoader.fetch_spot_ohlcv(selected_symbol, selected_tf)
 futures_df, futures_status = MarketDataLoader.fetch_futures_metrics(selected_symbol, selected_tf)
 trades_df, is_real_cvd, orderflow_status = MarketDataLoader.fetch_trade_level_orderflow(selected_symbol)
 
 if spot_df is not None and not spot_df.empty:
     
-    # Calculate Indicators
-    spot_df['atr'] = QuantitativeEngine.calculate_atr(spot_df)
     anchor_info = QuantitativeEngine.detect_smart_anchor(spot_df, mode=anchor_mode)
-    spot_df = QuantitativeEngine.calculate_vwap_suite(spot_df, anchor_info)
+    spot_df = QuantitativeEngine.calculate_indicators(spot_df, anchor_info)
     spot_df, is_real_cvd = QuantitativeEngine.build_orderflow_cvd(spot_df, trades_df)
     
     market_regime = QuantitativeEngine.detect_market_regime(spot_df)
     
-    # Assess Data Quality Score
     data_quality = 100
     if spot_status == DataStatus.FALLBACK: data_quality -= 20
     if futures_status == DataStatus.UNAVAILABLE: data_quality -= 20
     if not is_real_cvd: data_quality -= 15
     
-    # Multi-Factor Scoring & MFT Evaluation
     factors = FactorScoringEngine.evaluate_factors(spot_df, futures_df, is_real_cvd, market_regime)
     mft_res = MultiTimeframeEngine.evaluate_mft(selected_symbol, anchor_mode)
     
-    # Signal Grade Classification
     signal_grade, confidence_score, reasons = SignalAndRiskEngine.classify_signal(
         factors['global_score'], mft_res['htf_bias'], data_quality, market_regime
     )
     
-    # Header Badges (Live Status)
     badge_class = "status-badge-live" if spot_status == DataStatus.LIVE else "status-badge-fallback"
     cvd_type_label = "REAL (Trade-Level)" if is_real_cvd else "APPROXIMATED (Candle-Level)"
     
@@ -721,9 +624,7 @@ if spot_df is not None and not spot_df.empty:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- TOP DASHBOARD METRICS ---
     st.markdown("### 🌐 اللوحة التنفيذية الموحدة (Executive Dashboard)")
-    
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("الدرجة التشغيلية (Grade)", signal_grade, f"Confidence: {confidence_score}%")
     col2.metric("التقييم المركب (Global Score)", f"{factors['global_score']} / 100", f"HTF Bias: {mft_res['htf_bias']}")
@@ -732,7 +633,6 @@ if spot_df is not None and not spot_df.empty:
 
     st.markdown("---")
 
-    # --- DETAILED FACTOR BREAKDOWN PANEL ---
     with st.expander("🔬 تفكيك العوامل الكمية (Factor Breakdown - Anti-Double Counting)", expanded=False):
         f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
         f_col1.metric("Price Structure", f"{factors['price_score']:.1f}")
@@ -740,12 +640,9 @@ if spot_df is not None and not spot_df.empty:
         f_col3.metric("Positioning & OI", f"{factors['positioning_score']:.1f}")
         f_col4.metric("Trend Alignment", f"{factors['trend_score']:.1f}")
         f_col5.metric("VWAP Location", f"{factors['vwap_score']:.1f}")
-        
         st.caption(f"• **حالة تدفق السيولة المفتوحة (OI):** {factors['oi_state']}")
 
-    # --- CHART AND RISK CALCULATION SECTION ---
     c_chart, c_risk = st.columns([3, 1])
-    
     latest_close = spot_df['close'].iloc[-1]
     is_long_trade = "LONG" in signal_grade or factors['global_score'] >= 50
     
@@ -781,7 +678,6 @@ if spot_df is not None and not spot_df.empty:
             st.write(f"- {r}")
 
     with c_chart:
-        # Multi-panel Plotly Chart (Price + 3-VWAP, CVD, Open Interest)
         fig = make_subplots(
             rows=3, cols=1,
             shared_xaxes=True,
@@ -789,7 +685,6 @@ if spot_df is not None and not spot_df.empty:
             row_heights=[0.60, 0.20, 0.20]
         )
 
-        # Panel 1: Candlesticks & 3-VWAP Suite
         fig.add_trace(go.Candlestick(
             x=spot_df['timestamp'], open=spot_df['open'], high=spot_df['high'],
             low=spot_df['low'], close=spot_df['close'], name='Price'
@@ -810,13 +705,11 @@ if spot_df is not None and not spot_df.empty:
             name=f"Anchored VWAP ({anchor_info['type']})", line=dict(color='cyan', width=2, dash='dash')
         ), row=1, col=1)
 
-        # Panel 2: Order Flow CVD
         fig.add_trace(go.Scatter(
             x=spot_df['timestamp'], y=spot_df['cvd'], mode='lines',
             name='CVD Order Flow', line=dict(color='deepskyblue', width=2), fill='tozeroy'
         ), row=2, col=1)
 
-        # Panel 3: Open Interest (If available)
         if futures_df is not None and not futures_df.empty:
             fig.add_trace(go.Scatter(
                 x=futures_df['timestamp'], y=futures_df['openInterest'], mode='lines',
@@ -824,7 +717,7 @@ if spot_df is not None and not spot_df.empty:
             ), row=3, col=1)
 
         fig.update_layout(
-            title=f"شارت {selected_symbol} - {selected_tf} (Subplots Engine)",
+            title=f"شارت {selected_symbol} - {selected_tf} (Quantitative Engine v3.0)",
             template="plotly_dark",
             xaxis_rangeslider_visible=False,
             height=700,
