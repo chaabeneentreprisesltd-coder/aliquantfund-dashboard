@@ -100,11 +100,9 @@ class MarketDataLoader:
     @staticmethod
     @st.cache_data(ttl=15)
     def fetch_klines(symbol: str, interval: str, limit: int = 300) -> Tuple[Optional[pd.DataFrame], str]:
-        """جلب الشموع عبر 3 طبقات حماية لمنع الفشل تماماً على Streamlit Cloud"""
         formatted_symbol = symbol.replace("/", "").upper()
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
-        # --- Layer 1: Binance Multi-Server Endpoints (Vision API Never Blocks IPs) ---
         binance_endpoints = [
             f"https://data-api.binance.vision/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
             f"https://api1.binance.com/api/v3/klines?symbol={formatted_symbol}&interval={interval}&limit={limit}",
@@ -130,7 +128,6 @@ class MarketDataLoader:
             except Exception:
                 continue
 
-        # --- Layer 2: Bybit Spot API ---
         try:
             bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(interval, '5')
             url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={formatted_symbol}&interval={bybit_tf}&limit={limit}"
@@ -147,24 +144,6 @@ class MarketDataLoader:
         except Exception as e:
             logger.warning(f"Bybit kline fetch failed: {e}")
 
-        # --- Layer 3: KuCoin Public API (Fail-Safe) ---
-        try:
-            ku_symbol = f"{symbol.split('/')[0]}-USDT".upper()
-            ku_tf = MarketDataLoader.KUCOIN_TF_MAP.get(interval, '5min')
-            url = f"https://api.kucoin.com/api/v1/market/candles?symbol={ku_symbol}&type={ku_tf}"
-            res = requests.get(url, headers=headers, timeout=4)
-            if res.status_code == 200:
-                data = res.json().get('data', [])
-                if data:
-                    df = pd.DataFrame(data, columns=['timestamp', 'open', 'close', 'high', 'low', 'volume', 'turnover'])
-                    for col in ['open', 'high', 'low', 'close', 'volume']:
-                        df[col] = df[col].astype(float)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='s', utc=True).dt.tz_localize(None)
-                    df = df.iloc[::-1].reset_index(drop=True)
-                    return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']], DataStatus.FALLBACK.value
-        except Exception as e:
-            logger.warning(f"KuCoin kline fetch failed: {e}")
-
         return None, DataStatus.UNAVAILABLE.value
 
     @staticmethod
@@ -174,7 +153,7 @@ class MarketDataLoader:
         headers = {'User-Agent': 'Mozilla/5.0'}
         funding_meta = {'available': False, 'current': None, 'history': []}
 
-        # --- Primary: Binance Futures ---
+        # --- Attempt 1: Binance Futures ---
         try:
             binance_oi_interval = interval if interval in ('5m', '15m', '1h', '4h', '1d') else '5m'
             url_oi = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={formatted_symbol}&period={binance_oi_interval}&limit={limit}"
@@ -204,11 +183,10 @@ class MarketDataLoader:
         except Exception as e:
             logger.warning(f"Binance Futures fetch failed: {e}")
 
-        # --- Fallback: Bybit Linear ---
+        # --- Attempt 2: Bybit Linear ---
         try:
             bybit_tf = MarketDataLoader.BYBIT_TF_MAP.get(interval, '5')
-            interval_time = f"{bybit_tf}" if interval != '1d' else '1d'
-            url_oi = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={formatted_symbol}&intervalTime={interval_time}&limit={limit}"
+            url_oi = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={formatted_symbol}&intervalTime={bybit_tf}&limit={limit}"
             res_oi = requests.get(url_oi, headers=headers, timeout=4)
 
             if res_oi.status_code == 200:
@@ -218,7 +196,7 @@ class MarketDataLoader:
                     df_oi['openInterest'] = pd.to_numeric(df_oi['openInterest'], errors='coerce')
                     df_oi['timestamp'] = pd.to_datetime(df_oi['timestamp'].astype(float), unit='ms', utc=True).dt.tz_localize(None)
                     df_oi = df_oi.dropna(subset=['openInterest']).iloc[::-1].reset_index(drop=True)
-                    return df_oi, DataStatus.FALLBACK.value, funding_meta
+                    return df_oi, DataStatus.LIVE.value, funding_meta
         except Exception as e:
             logger.warning(f"Bybit OI fetch failed: {e}")
 
@@ -530,9 +508,15 @@ def main():
         return
 
     atr = QuantitativeEngine.calculate_atr(df_klines).iloc[-1]
-    vwap_sess = QuantitativeEngine.calculate_vwap(df_klines, 'SESSION').iloc[-1]
-    vwap_week = QuantitativeEngine.calculate_vwap(df_klines, 'WEEKLY').iloc[-1]
-    vwap_month = QuantitativeEngine.calculate_vwap(df_klines, 'MONTHLY').iloc[-1]
+    
+    # حساب سلاسل الـ VWAP كاملة
+    vwap_sess_series = QuantitativeEngine.calculate_vwap(df_klines, 'SESSION')
+    vwap_week_series = QuantitativeEngine.calculate_vwap(df_klines, 'WEEKLY')
+    vwap_month_series = QuantitativeEngine.calculate_vwap(df_klines, 'MONTHLY')
+    
+    vwap_sess = vwap_sess_series.iloc[-1]
+    vwap_week = vwap_week_series.iloc[-1]
+    vwap_month = vwap_month_series.iloc[-1]
     
     anchor_idx, anchor_reason = QuantitativeEngine.detect_smart_anchor(df_klines)
     avwap_series = QuantitativeEngine.calculate_anchored_vwap(df_klines, anchor_idx)
@@ -630,8 +614,9 @@ def main():
         name="Price"
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df_klines['timestamp'], y=df_klines['close'].assign(v=vwap_sess)['v'], mode='lines', name='Session VWAP', line=dict(color='#FFD600', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df_klines['timestamp'], y=df_klines['close'].assign(v=vwap_week)['v'], mode='lines', name='Weekly VWAP', line=dict(color='#00E676', width=1.5, dash='dash')), row=1, col=1)
+    # إضافة سلاسل الـ VWAP الحقيقية بشكل صحيح إلى الشارت
+    fig.add_trace(go.Scatter(x=df_klines['timestamp'], y=vwap_sess_series, mode='lines', name='Session VWAP', line=dict(color='#FFD600', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_klines['timestamp'], y=vwap_week_series, mode='lines', name='Weekly VWAP', line=dict(color='#00E676', width=1.5, dash='dash')), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=df_klines['timestamp'], 
